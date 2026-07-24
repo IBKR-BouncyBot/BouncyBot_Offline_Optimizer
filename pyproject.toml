@@ -1,0 +1,67 @@
+[project]
+name = "bouncybot-offline-optimizer"
+version = "1.6.0"
+description = "Read-only BouncyBot trade-data analysis and standalone Market Replay ATR optimization"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7,<7",
+    "tzdata>=2025.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "coverage>=7.6,<8",
+    "ruff>=0.8,<1",
+    "pyright[nodejs]>=1.1,<2",
+    "pyinstaller>=6.21,<7",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 160
+extend-exclude = ["build", "dist", "release", ".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "B006", "B007", "B018", "B904", "I001", "SIM101", "SIM103"]
+ignore = []
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+include = ["optimizer", "scripts/*.py"]
+exclude = ["build", "dist", "release", ".venv", "tests"]
+reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+
+[tool.coverage.run]
+branch = true
+source = ["optimizer"]
+omit = ["optimizer/gui.py"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 85
+precision = 1
+exclude_lines = [
+    "if TYPE_CHECKING:",
+    "pragma: no cover",
+]
+
+[tool.coverage.json]
+show_contexts = false
+
+[tool.coverage.xml]
+output = "coverage.xml"

@@ -1,0 +1,25 @@
+# Exact Windows x64 release environment for BouncyBot Offline Optimizer.
+# Install in a fresh Python 3.11.9 x64 virtual environment with --no-deps.
+# Update intentionally and validate on Windows before changing this file.
+altgraph==0.17.5
+colorama==0.4.6
+coverage==7.15.2
+iniconfig==2.3.0
+nodeenv==1.10.0
+nodejs-wheel-binaries==24.16.0
+packaging==26.2
+pefile==2024.8.26
+pluggy==1.6.0
+Pygments==2.20.0
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+pyright==1.1.411
+PySide6==6.11.1
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+pytest==9.1.1
+pywin32-ctypes==0.2.3
+ruff==0.15.22
+shiboken6==6.11.1
+typing-extensions==4.16.0
+tzdata==2026.3

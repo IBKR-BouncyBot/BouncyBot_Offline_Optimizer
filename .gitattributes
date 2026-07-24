@@ -1,2 +1,24 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Normalize source text so tagged checkouts have stable content across platforms.
+* text=auto eol=lf
+
+# Windows launchers remain conventional CRLF text in Git checkouts.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# POSIX entry points remain LF and executable mode is preserved by Git.
+*.sh text eol=lf
+
+# Never apply text conversion to captured data, databases, archives, or images.
+*.ibrec binary
+*.sqlite binary
+*.sqlite3 binary
+*.db binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.pyd binary

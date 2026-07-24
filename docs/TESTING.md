@@ -1,0 +1,127 @@
+# Testing
+
+## Automated coverage
+
+The suite covers:
+
+- absent, pre-existing, and race-created bot locks;
+- atomic acquisition, double-acquire rejection, PID-write failure cleanup, and owned-lock-only removal;
+- source database/capture symlink escape rejection;
+- SQLite/WAL/shared-memory and complete capture-set mutation detection;
+- read-only SQLite/WAL staging, committed-WAL inclusion, and source-byte preservation;
+- schema-tolerant loading, deterministic tie ordering, large-event-table avoidance, and decision-event filtering;
+- execution fallback for incomplete cycle fills and protective-exit separation;
+- corrupt, oversized, malformed, duplicate-member, stale-only, JSONL, CSV, and unusable-JSONL-with-CSV capture handling;
+- no-extraction ZIP traversal resistance and capture symlink boundaries;
+- retention of distinct same-timestamp market/quote updates and removal of only semantically identical rows;
+- ATR reconstruction, candidate clamps, zero immediate-market behavior, historical fallback, future-fallback rejection, and alternate-window fallback rejection;
+- directionally valid faster/smoother windows at small and large settings boundaries;
+- exact BUY and SELL trail boundaries, manual minimum profit, order-after-window behavior, and chronological SELL activation;
+- explicit triggered/right-censored/unavailable outcomes, non-future fill-quote selection, and Kaplan-Meier horizon support;
+- historical setting profiles, A → B → A regimes, current-settings separation, field-wise median summaries, missing-field defaults, and per-profile candidate metrics;
+- candidate aggregation, zero/negative score ordering, evidence thresholds, and alternate-window ATR-coverage gating;
+- identical-cycle candidate/control pairing, duplicate and immutable-context fail-closed exclusions, candidate-only/control-only triggers, and right-censored paired outcomes;
+- deterministic trading-day cluster bootstrap intervals, input-order independence, and leave-one-day-out influence/sign-reversal detection;
+- empirical BUY/SELL spread and slippage adjustment, cycle-level leave-one-out, stale and crossed quote exclusion, Last fallback, conflicting same-cycle fill-context rejection, and preservation of real zero per-pair sample counts;
+- true-grid adjacency, isolated-peak rejection, lower robust plateau selection, deterministic stable-region center, and timing/MAE/trigger-probability gates;
+- deterministic one-profile selection, one-leg/baseline-window eligibility, full robustness-gate enforcement, exact tie-breaking, and unchanged-control fallback;
+- primary-profile HTML placement, JSON identity, single-row CSV export, and repeated-analysis equality;
+- deterministic report identity and byte output in the same process, across source/output paths, and in subprocesses with different `PYTHONHASHSEED` values;
+- deterministic identity and byte output after modification-time-only changes to otherwise identical source files;
+- refusal to overwrite a divergent existing content-addressed directory;
+- refusal to use the bot lock, SQLite main/WAL/SHM paths, or anything below those files as the report root;
+- exact-period/bar requirements for bot-captured ATR fallback and no ticker-median substitution when the capture context is unknown;
+- controlled CLI handling of an incompatible SQLite schema without a traceback or leaked lock;
+- accurate no-history report wording that distinguishes documented defaults from observed settings;
+- source-controlled HTML escaping and spreadsheet-formula neutralization;
+- GUI tooltip definitions, ticker report paths, and—when PySide6 is installed—per-row report-button wiring;
+- CLI success, cancellation, safety errors, JSON result, and rejection of disabled capture hashes;
+- version, release-documentation, build, confirmation, no-network, and wrapper-variable contracts;
+- absence of literal-only f-strings across application and test Python sources.
+
+The cross-process determinism test removes inherited coverage/tracing startup
+variables from its child environment. This keeps the child optimizer process
+independent and prevents third-party coverage startup hooks from replacing the
+parent quality gate's coverage data at child exit.
+
+## Windows quality gate
+
+```text
+compileall
+Ruff
+Pyright
+pytest with ResourceWarning=error
+branch coverage with 85% minimum
+```
+
+The historical v1.1.0 Windows run completed 103 tests with two environment skips, then Ruff reported one `F541` literal-only f-string in `optimizer/presentation.py`. Version 1.2.0 removed that prefix and added a source-wide regression check. Version 1.4.1 makes that check lexical-token based so it behaves consistently under Python 3.11 and Python 3.12+, removes two additional genuine literal-only prefixes, and adds simulated Windows directory-lock tests for both the atomic helper and complete SQLite report publication. Version 1.4.2 isolates the injected directory-move callable inside the publication module so the end-to-end test no longer mutates or counts unrelated process-wide `os.replace` operations on Windows. Version 1.4.3 removes the remaining environment-dependent exact retry-count assumption: the integration test now verifies the injected failures, bounded retry behavior, single publication target, and completed report while allowing a real scanner or indexer to add another legitimate transient denial. Version 1.4.4 corrects the ten Ruff diagnostics reported after the complete v1.4.3 pytest run and moves compilation, Ruff, and Pyright ahead of coverage so source-quality failures stop the gate before the longer test pass. Version 1.4.5 corrects the subsequent Pyright scalar/optional diagnostics, passes the exact project-local interpreter through `--pythonpath`, and declares the same `.venv` in project configuration so installed PySide6 modules are resolved without disabling missing-import checks. The full Windows gate remains the authoritative confirmation because Ruff, Pyright, and native PySide6 may not be installed in every offline build environment.
+
+The Windows release builder also launches the generated `BouncyBotOfflineOptimizer.exe` in a hidden smoke-test mode. That mode imports the complete GUI entry module without creating a window. The build fails if the frozen executable or bundled PySide6 runtime cannot load and exit successfully within 30 seconds.
+
+## Packaged smoke testing
+
+A Windows release candidate should additionally verify:
+
+- clean-machine launch without Python installed;
+- source and output folder browsing;
+- cell/header tooltip display;
+- every ticker's **Open report** button;
+- the highlighted **One settings set to evaluate next** section and its single-row CSV;
+- paired-evidence, execution-model, censoring, bootstrap, influence, and stable-region explanations/CSV exports;
+- user cancellation;
+- existing-lock blocking;
+- concurrent BouncyBot launch blocking while analysis holds the lock;
+- deterministic rerun reuse;
+- local HTML opening;
+- side-by-side placement beside BouncyBot;
+- source file hashes unchanged after analysis.
+
+## v1.4 Market Replay tests
+
+Version 1.4 adds tests for both `.ibrec` containers and the separate workflow:
+
+- format-2 ZIP schema, checksums, duplicate members/columns, line, row, and expansion limits;
+- format-3 SQLite schema, `user_version`, integrity checks, foreign keys, per-record hashes, chain hashes, RTH digest, and checkpoints;
+- the supplied Market Replay Lab 1.3.0 format-3 sample;
+- source-copy verification, mutation detection, rollback-journal recovery/state checks, WAL/SHM rejection, final-component replacement/symlink rejection, and path-independent report identity;
+- valid active-period recovery with no committed observed end, receipt-clock reversal handling, strict monotonic `elapsed_ns`, empty-recording preflight, and full-analysis empty-data rejection;
+- raw-row integrity validation followed by semantics-preserving size/volume-event compression;
+- UTC-aligned simple ATR reconstruction and exact Last-event trail triggering;
+- full-cycle BUY/SELL simulation, stop normalization, minimum-profit protection, crossed-quote exclusion, feed selection, exact cancellation-boundary classification, right-censoring, and conservative open-position treatment;
+- synthetic, delayed-only, mixed live/delayed, frozen-interruption, and receipt-clock evidence stability gates;
+- bounded grid/refinement, stable-region selection, one-profile output, and deterministic reports;
+- terminal success/failure behavior and independence from the trading-bot lock;
+- optional native PySide6 preflight, result table, tooltips, and report button wiring.
+
+The Windows quality gate remains authoritative for Ruff, Pyright, native PySide6, and frozen PyInstaller execution. The release builder's hidden smoke mode imports the full GUI plus Market Replay parser and report modules before accepting the executable.
+
+The Windows build also collects the `tzdata` package required for portable format-2 timezone/liquid-hours reconstruction.
+
+
+## v1.5 three-stage search, robustness, and release reproducibility tests
+
+Version 1.5 adds regression coverage for:
+
+- independent stage-1 bar-duration and stage-2 ATR-period selection;
+- unconditional retention of the unchanged 14-period/60-second control;
+- stage-3 candidate confinement to the narrowed ATR windows;
+- same-session candidate/control pairing;
+- deterministic 2,000-replicate whole-trading-day bootstrap intervals;
+- leave-one-day-out influence, sign-reversal, and single-day-dominance rejection;
+- fallback to the unchanged control when a changed candidate is unstable;
+- new report files and explanations;
+- byte-identical deterministic ZIP output despite source modification-time changes;
+- exact release-lock, license, `.gitignore`, and Windows build-script contracts;
+- importability and fail-closed behavior of the release helper scripts.
+
+A production Windows release additionally requires two independently built PyInstaller directory trees to compare byte-for-byte before packaging. The normalized ZIP is recreated and its hash must match the first archive.
+
+## v1.5.3 Windows archive and source-audit regression tests
+
+Version 1.5.3 adds cross-platform tests for deterministic executable metadata and source-tree isolation. A shebang script and native Windows executable must receive mode `0755` in the archive even when Windows reports no POSIX execute bit, while plain shell text and PowerShell scripts remain `0644`. The source manifest and source text audit share the same release-source filtering rules and prune `.venv`, `.venv-release`, custom `.venv-*`, build, release, cache, capture, and generated-report trees before traversal.
+
+## v1.6 multi-recording and recommendation-soundness tests
+
+Version 1.6 adds regression coverage for immutable multi-path configuration, duplicate path/content rejection, same-instrument validation, aggregate row/byte limits, deterministic input-order independence, strict same-date overlap exclusion, multi-file report determinism, monotonic ATR timing, stale-gap warm-up reset, five-second phase stress, same-side touch fills, immediate spread drawdown, stale pre-entry bid rejection, unmarked open positions, right-censor authorization failure, refinement-window distribution, complete report inventories, and path-independent component fingerprints.
+
+The complete release gate still promotes `ResourceWarning` to an error, enforces branch-aware coverage, compiles all Python files, and requires Ruff and Pyright on Windows. The portable build remains a two-pass byte-comparison PyInstaller build using the exact release lock.
