@@ -328,7 +328,7 @@ The Market Replay search separates ATR bar duration from ATR period before searc
 
 The hierarchy makes period and bar duration separately observable and limits the much larger full cross-product. It also imposes an interaction limitation: stage 1 and stage 2 use the unchanged control multipliers, so a window that is weak under those multipliers does not reach stage 3 even if it might have performed well under another multiplier combination. The result is the strongest supported profile inside this staged search, not an exhaustive optimum over every possible period, bar, and multiplier combination.
 
-Candidate score combines median, mean, and worst conservative session returns, maximum drawdown, open-position rate, no-trade rate, and right-censoring rate. Every candidate keeps every analyzable session in its denominator.
+The balanced candidate score is defined once by an immutable score policy and combines median, mean, and worst conservative session returns, maximum drawdown, unresolved open-position rate, right-censoring rate, execution cost, and turnover. Every candidate keeps every analyzable session in its denominator. A no-trade session contributes a zero return but receives no separate direct penalty. The exact active policy is serialized into the report so calculation and documentation cannot drift.
 
 Profiles near the best score are linked by one-step multiplier adjacency within the same ATR period/bar window advances through stage 2. A stable-region center is preferred to an isolated numerical maximum.
 
@@ -367,3 +367,32 @@ ATR OHLC buckets use recorder `elapsed_ns`, matching BouncyBot's monotonic-clock
 The fill model is fail-closed. A BUY trigger becomes fillable only when a valid non-crossed ask is present; a SELL trigger becomes fillable only when a valid non-crossed bid is present. Last, mark, close, and the opposite touch do not prove market-order execution. An open long is marked only from bid observations recorded after its BUY fill. A stale pre-entry bid cannot be reused. Missing post-entry bid evidence leaves the session unmarked and blocks a changed recommendation.
 
 The three-stage search is rerun after every omitted trading day: stage 1 bar-duration selection, stage 2 period selection, complete stage 3 coarse multipliers, omission-specific refinement, and stable-region selection. The bootstrap samples whole dates and applies the same deterministic draws to every center. These are conservative in-sample rejection tests; they do not replace later unseen-data validation.
+
+## Version 1.8 continuous overnight replay and optional execution calibration
+
+The Market Replay state machine can now preserve an unresolved long position across provably consecutive, complete, primary-quality RTH recordings. It carries the modeled BUY cost basis and quantity, realized equity, continuity-chain drawdown, and—when already submitted—the locked native SELL trail, running high, and stop. An unsubmitted SELL is not frozen across the boundary: the next RTH session must reconstruct and warm its ATR before minimum-profit activation and trail submission can occur. BUY trails are never carried because the standardized strategy cancels them before the close.
+
+Continuity is deliberately fail-closed. Both adjacent sessions must pass the primary quality gate, dates must be conservatively consecutive under the built-in weekday rule, and the closing session must contain a valid post-entry bid mark. Friday-to-Monday continuity is accepted. A missing weekday, ambiguous holiday, overlap, fragment, delayed period, internal connectivity failure, or incomplete end breaks the chain. Without a complete exchange calendar, the optimizer treats holiday ambiguity as missing evidence rather than inventing continuity.
+
+Whole-day bootstrap units become complete overnight-continuity blocks when a position links several sessions. This avoids resampling economically dependent days independently. The resulting bootstrap remains in-sample and can still understate serial dependence across broader market regimes.
+
+The optional BouncyBot SQLite calibration is a separate read-only evidence prepass. It acquires the normal bot lock, fingerprints and privately snapshots the SQLite main file and sidecars, reads actual executions and cycle-level commission evidence, verifies that the source did not change, and releases the lock before the ATR search. `debug_captures` is not required for this path.
+
+Calibration prefers exact positive conId matches and uses ticker-only legacy rows only when no exact-contract cycle exists. It groups executions by broker order, matches each actual fill to the latest non-future same-side `.ibrec` touch inside the configured age limit, and rejects crossed, stale, non-finite, or currency-incompatible evidence. The 75th-percentile adverse commission-plus-slippage estimate may increase—but never decrease—the configured per-side cost reserve. A median actual BUY notional may replace the configured research notional only after the configured minimum sample count. These two replacements can be disabled independently.
+
+Actual executions calibrate assumptions; they do not recreate the counterfactual queue position, market impact, routing, depth, hidden liquidity, FX conversion, or exact hypothetical fill. The independent BouncyBot and Market Replay subscriptions may also differ slightly in callback timing and top-of-book state. The calibrated result remains a paper-testing candidate, not proof of executable future performance.
+
+
+## 28. Version 1.9 robust selection validation
+
+Every primary-eligible date is removed once from the raw chronological period list. The optimizer then rebuilds overnight continuity and reruns bar-duration selection, ATR-period selection, the complete Stage 3 grid, omission-specific refinement, and stable-region selection. Fixed candidate/control evidence is recalculated on the same reduced chronology.
+
+When at least 20 primary-quality sessions exist, expanding walk-forward folds select only on earlier training sessions and evaluate the frozen selection on the next five unseen sessions. Training returns are excluded from validation scoring and drawdown is rebased at the validation boundary. A legitimately open position may cross that boundary.
+
+Two additional resampling checks are used. Circular moving blocks preserve short runs of adjacent market regimes. Selection-aware bootstrap reruns the three-stage selector in each bootstrap training bag and evaluates the selected profile on out-of-bag continuity units. Dates linked by one overnight position or active SELL order are never split into independent resampling units.
+
+SQLite calibration produces separate BUY and SELL p50, p75, and p90 cost distributions. Primary assumptions use conservative p75 evidence; stress analysis uses p90 evidence. Per-date assumptions prefer strictly earlier executions and otherwise use leave-date-out evidence shrunk toward the configured default.
+
+The changed candidate must remain preferable under balanced, drawdown-focused, return-focused, and cost-stressed score policies; it must not be Pareto dominated; and any stable region touching a search boundary must be extended and resolved. Fixed candidate/control replay is also repeated under cost, quote-age, notional, entry-delay, and entry-cutoff stress.
+
+The final report emits a named pass/fail row for each authorization gate. Exactly one profile is always emitted. Any required gate that is unavailable or fails causes the unchanged control to be displayed for reference.

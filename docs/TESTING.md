@@ -106,7 +106,7 @@ Version 1.5 adds regression coverage for:
 - unconditional retention of the unchanged 14-period/60-second control;
 - stage-3 candidate confinement to the narrowed ATR windows;
 - same-session candidate/control pairing;
-- deterministic 2,000-replicate whole-trading-day bootstrap intervals;
+- deterministic 2,000-replicate trading-day or overnight-continuity-block bootstrap intervals;
 - leave-one-day-out influence, sign-reversal, and single-day-dominance rejection;
 - fallback to the unchanged control when a changed candidate is unstable;
 - new report files and explanations;
@@ -125,3 +125,40 @@ Version 1.5.3 adds cross-platform tests for deterministic executable metadata an
 Version 1.6 adds regression coverage for immutable multi-path configuration, duplicate path/content rejection, same-instrument validation, aggregate row/byte limits, deterministic input-order independence, strict same-date overlap exclusion, multi-file report determinism, monotonic ATR timing, stale-gap warm-up reset, five-second phase stress, same-side touch fills, immediate spread drawdown, stale pre-entry bid rejection, unmarked open positions, right-censor authorization failure, refinement-window distribution, complete report inventories, and path-independent component fingerprints.
 
 The complete release gate still promotes `ResourceWarning` to an error, enforces branch-aware coverage, compiles all Python files, and requires Ruff and Pyright on Windows. The portable build remains a two-pass byte-comparison PyInstaller build using the exact release lock.
+
+## v1.8 continuous replay and calibration tests
+
+Version 1.8 adds regression coverage for:
+
+- Friday-to-Monday overnight continuity and conservative weekday/holiday breaks;
+- preservation of cost basis, quantity, realized equity, continuity-chain drawdown, submitted SELL-trail state, pending SELL fills, and detailed trade identity;
+- ATR re-warm before an unsubmitted next-session SELL and locked handling of an already-submitted native SELL trail;
+- refusal to carry an open long without a valid closing bid mark;
+- disabling overnight replay and terminalizing unresolved state at each RTH boundary;
+- whole-day bootstrap grouping by overnight-continuity block;
+- SQLite-only calibration folders without `debug_captures`;
+- normal bot-lock exclusion, private database snapshotting, exact conId preference, ticker-only legacy fallback, and path-independent calibration fingerprints;
+- no-future same-side quote matching, quote-age limits, explicit same-price refreshes, crossed/stale quote rejection, and commission-currency rejection;
+- broker-order grouping, row-level versus cycle-level commission evidence, 75th-percentile conservative cost reserve, minimum sample gates, and independent cost/notional replacement toggles;
+- deterministic calibrated reports, new continuity/calibration CSV exports, GUI/CLI controls, and version/release metadata.
+
+A production Windows release still requires Ruff, Pyright, native PySide6 interaction, and the two-pass reproducible PyInstaller build from the exact source archive. Linux validation does not substitute for those Windows-specific gates.
+
+## v1.9 robust-selection regression coverage
+
+The v1.9 tests additionally cover:
+
+- one immutable balanced score definition shared by calculation and reports;
+- drawdown-focused, return-focused, and cost-stressed policy comparisons;
+- Pareto dominance and rejection of fully dominated candidates;
+- exact raw-date leave-one-out chronology reconstruction;
+- expanding walk-forward fold construction, training-only selection, and validation drawdown rebasing;
+- deterministic moving-block samples and selection-aware out-of-bag bootstrap;
+- overnight-dependency union across candidate and control profiles;
+- separate BUY/SELL p50/p75/p90 execution evidence and date-cross-fitted assumptions;
+- search-boundary detection, outward extension, and unresolved-boundary rejection;
+- execution, quote-age, notional, and timing assumption stress;
+- economic overnight-continuity metrics and named recommendation-gate completeness;
+- deterministic reports containing every new evidence CSV.
+
+The Linux release gate may execute the suite in disjoint processes when the host's third-party pytest instrumentation does not terminate cleanly after a large combined run. Every collected test file must still be included exactly once, `ResourceWarning` remains fatal, and coverage is accumulated across the disjoint processes before the 85% branch-aware gate is evaluated. The authoritative Windows gate remains `run_all_tests.bat` followed by the reproducible PyInstaller build.

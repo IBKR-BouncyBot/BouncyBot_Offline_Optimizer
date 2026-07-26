@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from .utils import finite_float, finite_int
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -230,15 +231,7 @@ def safe_float(value: Any) -> float | None:
     # A SQLite/JSON boolean is not a quantity, price, or percentage.  Python's
     # normal ``float(True) == 1.0`` coercion would otherwise make malformed data
     # look valid and could change coverage or replay results.
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number != number or number in (float("inf"), float("-inf")):
-        return None
-    return number
+    return finite_float(value)
 
 
 def safe_int(value: Any) -> int | None:
@@ -250,12 +243,4 @@ def safe_int(value: Any) -> int | None:
     period or cycle number without any warning.
     """
 
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(number) or not number.is_integer():
-        return None
-    return int(number)
+    return finite_int(value)

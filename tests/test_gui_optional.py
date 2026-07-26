@@ -74,7 +74,9 @@ def test_market_replay_tab_preflights_v3_and_opens_its_separate_report(
     assert window.tabs.count() == 2
     assert window.tabs.tabText(1) == "Market Replay (.ibrec v2/v3)"
     assert window._check_ibrec() is True
-    assert "v3 sqlite" in window.ibrec_preflight_label.text()
+    preflight_text = window.ibrec_preflight_label.text()
+    assert "v3 sqlite" in preflight_text.lower()
+    assert "format(s) [3]" not in preflight_text
 
     opened: list[tuple[Path, str]] = []
     monkeypatch.setattr(

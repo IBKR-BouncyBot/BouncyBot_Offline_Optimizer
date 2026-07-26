@@ -7,11 +7,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$version = "1.6.0"
+$version = "1.9.2"
 $appName = "BouncyBotOfflineOptimizer"
 $runtimeDirectory = "BouncyBotOptimizerRuntime"
 $requiredPythonVersion = "3.11.9"
-$sourceDateEpoch = "1784592000"
+$sourceDateEpoch = "1785024000"
 $releaseName = "BouncyBot_Offline_Optimizer_${version}_Windows_x64"
 $releaseDirectory = Join-Path $root "release"
 $releaseRoot = Join-Path $releaseDirectory $releaseName

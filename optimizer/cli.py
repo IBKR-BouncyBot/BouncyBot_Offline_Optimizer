@@ -87,15 +87,76 @@ def _parser() -> argparse.ArgumentParser:
         default=64,
         help="Maximum number of Market Replay recordings accepted in one analysis",
     )
+    parser.add_argument(
+        "--ibrec-notional",
+        type=float,
+        default=10_000.0,
+        help="Assumed trade notional used for recorded top-of-book liquidity checks",
+    )
+    parser.add_argument(
+        "--ibrec-cost-bps-per-side",
+        type=float,
+        default=1.0,
+        help="Fixed execution-cost reserve charged on every modeled BUY and SELL side",
+    )
+    parser.add_argument(
+        "--ibrec-turnover-penalty-bps",
+        type=float,
+        default=0.25,
+        help="Additional screening-score penalty per completed simulated trade",
+    )
+    parser.add_argument(
+        "--calibration-source-dir",
+        type=Path,
+        help=(
+            "Optional stopped BouncyBot portable-data folder. Actual executions and commissions "
+            "are read from a private SQLite snapshot to calibrate notional and a conservative "
+            "per-side execution-cost reserve."
+        ),
+    )
+    parser.add_argument(
+        "--no-overnight-replay",
+        action="store_true",
+        help="Disable continuous position/SELL-trail carry across consecutive complete RTH recordings",
+    )
+    parser.add_argument(
+        "--calibration-max-quote-age-seconds",
+        type=float,
+        default=5.0,
+        help="Maximum age of a same-side .ibrec quote matched to an actual BouncyBot execution",
+    )
+    parser.add_argument(
+        "--calibration-min-samples",
+        type=int,
+        default=5,
+        help="Minimum per-side/cycle sample count before calibrated assumptions can replace configured values",
+    )
+    parser.add_argument(
+        "--no-calibrated-cost",
+        action="store_true",
+        help="Read calibration evidence but retain the configured per-side execution-cost reserve",
+    )
+    parser.add_argument(
+        "--no-calibrated-notional",
+        action="store_true",
+        help="Read calibration evidence but retain the configured assumed trade notional",
+    )
     return parser
 
 
-def _confirm(source_dir: Path) -> bool:
+def _confirm(source_dir: Path, *, calibration_only: bool = False) -> bool:
+    activity = (
+        "copy SQLite/WAL through read-only file access, create a private temporary snapshot, "
+        "derive execution-cost and trade-notional evidence, and release the lock before replay"
+        if calibration_only
+        else (
+            "copy SQLite/WAL through read-only file access, create a private temporary snapshot, "
+            "read capture ZIP files, and write only to the selected report directory"
+        )
+    )
     message = (
         "The trading-bot lock file is absent. Confirm that BouncyBot is fully closed.\n"
-        "The optimizer will temporarily acquire the same lock, copy SQLite/WAL through read-only file access, "
-        "create a private temporary snapshot, "
-        "read capture ZIP files, and write only to the selected report directory.\n"
+        f"The optimizer will temporarily acquire the same lock, {activity}.\n"
         f"Source: {source_dir}\n"
         "Continue [y/N]? "
     )
@@ -173,7 +234,7 @@ def run_terminal(args: argparse.Namespace) -> int:
 
 
 def run_market_replay_terminal(args: argparse.Namespace) -> int:
-    """Run the independent recording-set workflow without bot data or a bot lock."""
+    """Run recording analysis, optionally with read-only execution calibration."""
 
     raw_inputs = args.ibrec if isinstance(args.ibrec, (list, tuple)) else [args.ibrec]
     config = MarketReplayConfig(
@@ -183,7 +244,29 @@ def run_market_replay_terminal(args: argparse.Namespace) -> int:
         max_input_bytes=max(1, int(args.max_ibrec_mib)) * 1024 * 1024,
         max_zip_uncompressed_bytes=max(1, int(args.max_ibrec_zip_mib)) * 1024 * 1024,
         max_recordings=max(1, int(args.max_ibrec_files)),
+        assumed_trade_notional=float(args.ibrec_notional),
+        execution_cost_bps_per_side=float(args.ibrec_cost_bps_per_side),
+        turnover_penalty_bps_per_completed_trade=float(
+            args.ibrec_turnover_penalty_bps
+        ),
+        continuous_overnight_replay=not bool(args.no_overnight_replay),
+        calibration_source_dir=(
+            Path(args.calibration_source_dir)
+            if args.calibration_source_dir is not None
+            else None
+        ),
+        calibration_max_quote_age_seconds=float(
+            args.calibration_max_quote_age_seconds
+        ),
+        calibration_min_samples=max(1, int(args.calibration_min_samples)),
+        calibration_use_execution_cost=not bool(args.no_calibrated_cost),
+        calibration_use_trade_notional=not bool(args.no_calibrated_notional),
     )
+    if args.calibration_source_dir is not None and not args.yes:
+        calibration_root = Path(args.calibration_source_dir).expanduser().resolve()
+        if not _confirm(calibration_root, calibration_only=True):
+            print("Analysis cancelled.")
+            return 1
     try:
         progress_callback = (
             (
@@ -198,7 +281,14 @@ def run_market_replay_terminal(args: argparse.Namespace) -> int:
         )
         result = run_market_replay_analysis(config, progress=progress_callback)
         result = write_market_replay_report(result)
-    except (IbrecError, MarketReplayAnalysisError, OSError, ValueError) as exc:
+    except (
+        IbrecError,
+        MarketReplayAnalysisError,
+        SourceSafetyError,
+        DatabaseFormatError,
+        OSError,
+        ValueError,
+    ) as exc:
         print(f"ANALYSIS FAILED: {exc}", file=sys.stderr)
         return 3
     summary = {
@@ -213,6 +303,10 @@ def run_market_replay_terminal(args: argparse.Namespace) -> int:
         "recommended_profile": result.recommendation.profile.to_dict(),
         "recommendation_score": result.recommendation.score,
         "evidence_stable": result.recommendation.evidence_stable,
+        "continuous_overnight_replay": bool(
+            result.search_contract.get("continuous_overnight_replay")
+        ),
+        "execution_calibration": result.execution_calibration,
         "global_issues": result.global_issues,
     }
     if args.json_result:

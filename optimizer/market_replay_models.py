@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .utils import finite_float, finite_int
+
 
 def _positive_finite(value: float | None) -> float | None:
     if value is None:
@@ -16,15 +18,16 @@ def _positive_finite(value: float | None) -> float | None:
 
 
 def _strict_positive_int(value: Any, *, name: str, minimum: int) -> int:
-    if isinstance(value, bool):
+    number = finite_int(value)
+    if number is None or number < minimum:
         raise ValueError(f"{name} must be an integer of at least {minimum:,}.")
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be an integer of at least {minimum:,}.") from exc
-    if not math.isfinite(number) or not number.is_integer() or number < minimum:
-        raise ValueError(f"{name} must be an integer of at least {minimum:,}.")
-    return int(number)
+    return number
+
+
+def _strict_bool(value: Any, *, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean.")
+    return value
 
 
 @dataclass(slots=True)
@@ -46,6 +49,28 @@ class MarketReplayConfig:
     max_recordings: int = 64
     min_atr_pct: float = 0.10
     max_atr_pct: float = 20.00
+    assumed_trade_notional: float = 10_000.0
+    execution_cost_bps_per_side: float = 1.0
+    buy_execution_cost_bps_per_side: float | None = None
+    sell_execution_cost_bps_per_side: float | None = None
+    execution_cost_overrides: tuple[tuple[str, float, float], ...] = ()
+    trade_notional_overrides: tuple[tuple[str, float], ...] = ()
+    turnover_penalty_bps_per_completed_trade: float = 0.25
+    execution_quote_max_age_seconds: float | None = None
+    entry_open_delay_seconds: int = 5 * 60
+    entry_cutoff_seconds: int = 15 * 60
+    buy_trail_cancel_seconds: int = 5 * 60
+    session_boundary_tolerance_seconds: float = 120.0
+    max_market_event_gap_seconds: float = 60.0
+    min_last_event_minute_coverage_pct: float = 80.0
+    max_last_event_gap_p95_seconds: float = 60.0
+    min_touch_liquidity_coverage_pct: float = 80.0
+    continuous_overnight_replay: bool = True
+    calibration_source_dir: Path | None = None
+    calibration_max_quote_age_seconds: float = 5.0
+    calibration_min_samples: int = 5
+    calibration_use_execution_cost: bool = True
+    calibration_use_trade_notional: bool = True
 
     @property
     def recording_paths(self) -> tuple[Path, ...]:
@@ -102,12 +127,184 @@ class MarketReplayConfig:
             name="max_zip_uncompressed_bytes",
             minimum=1_000_000,
         )
-        minimum = float(self.min_atr_pct)
-        maximum = float(self.max_atr_pct)
-        if not math.isfinite(minimum) or minimum <= 0:
-            raise ValueError("min_atr_pct must be finite and positive.")
-        if not math.isfinite(maximum) or maximum <= minimum or maximum >= 100:
-            raise ValueError("max_atr_pct must be finite, below 100, and above min_atr_pct.")
+
+        def finite_nonnegative(value: Any, *, name: str) -> float:
+            number = finite_float(value)
+            if number is None or number < 0:
+                raise ValueError(f"{name} must be a finite non-negative number.")
+            return number
+
+        minimum = finite_nonnegative(self.min_atr_pct, name="min_atr_pct")
+        maximum = finite_nonnegative(self.max_atr_pct, name="max_atr_pct")
+        # BouncyBot itself applies an absolute 0.01% lower bound and a 99.99%
+        # upper bound before rounding strategy percentages to two decimals.
+        # Accepting values outside that actionable range would let the
+        # optimizer recommend a profile the live application cannot reproduce.
+        if minimum < 0.01:
+            raise ValueError("min_atr_pct must be at least 0.01%.")
+        if maximum <= minimum or maximum > 99.99:
+            raise ValueError(
+                "max_atr_pct must be at most 99.99% and above min_atr_pct."
+            )
+
+        def finite_percentage(value: Any, *, name: str) -> float:
+            number = finite_nonnegative(value, name=name)
+            if number > 100:
+                raise ValueError(f"{name} must be between 0 and 100.")
+            return number
+
+        assumed_notional = finite_nonnegative(
+            self.assumed_trade_notional,
+            name="assumed_trade_notional",
+        )
+        if assumed_notional <= 0:
+            raise ValueError("assumed_trade_notional must be greater than zero.")
+        execution_cost = finite_nonnegative(
+            self.execution_cost_bps_per_side,
+            name="execution_cost_bps_per_side",
+        )
+        if execution_cost >= 10_000:
+            raise ValueError(
+                "execution_cost_bps_per_side must be below 10,000 bps so modeled execution prices remain positive."
+            )
+        buy_execution_cost = (
+            execution_cost
+            if self.buy_execution_cost_bps_per_side is None
+            else finite_nonnegative(
+                self.buy_execution_cost_bps_per_side,
+                name="buy_execution_cost_bps_per_side",
+            )
+        )
+        sell_execution_cost = (
+            execution_cost
+            if self.sell_execution_cost_bps_per_side is None
+            else finite_nonnegative(
+                self.sell_execution_cost_bps_per_side,
+                name="sell_execution_cost_bps_per_side",
+            )
+        )
+        if buy_execution_cost >= 10_000 or sell_execution_cost >= 10_000:
+            raise ValueError(
+                "BUY and SELL execution-cost reserves must remain below 10,000 bps."
+            )
+
+        cost_overrides: list[tuple[str, float, float]] = []
+        seen_cost_dates: set[str] = set()
+        for raw_date, raw_buy, raw_sell in self.execution_cost_overrides:
+            date_key = str(raw_date).strip()
+            if not date_key or date_key in seen_cost_dates:
+                raise ValueError(
+                    "execution_cost_overrides require unique non-empty session dates."
+                )
+            buy_value = finite_nonnegative(
+                raw_buy,
+                name=f"execution_cost_overrides[{date_key}].buy",
+            )
+            sell_value = finite_nonnegative(
+                raw_sell,
+                name=f"execution_cost_overrides[{date_key}].sell",
+            )
+            if buy_value >= 10_000 or sell_value >= 10_000:
+                raise ValueError("Date-specific execution reserves must be below 10,000 bps.")
+            seen_cost_dates.add(date_key)
+            cost_overrides.append((date_key, round(buy_value, 6), round(sell_value, 6)))
+
+        notional_overrides: list[tuple[str, float]] = []
+        seen_notional_dates: set[str] = set()
+        for raw_date, raw_value in self.trade_notional_overrides:
+            date_key = str(raw_date).strip()
+            value = finite_nonnegative(
+                raw_value,
+                name=f"trade_notional_overrides[{date_key}]",
+            )
+            if not date_key or date_key in seen_notional_dates or value <= 0:
+                raise ValueError(
+                    "trade_notional_overrides require unique dates and positive notionals."
+                )
+            seen_notional_dates.add(date_key)
+            notional_overrides.append((date_key, round(value, 2)))
+        turnover_penalty = finite_nonnegative(
+            self.turnover_penalty_bps_per_completed_trade,
+            name="turnover_penalty_bps_per_completed_trade",
+        )
+        execution_quote_age = (
+            None
+            if self.execution_quote_max_age_seconds is None
+            else finite_nonnegative(
+                self.execution_quote_max_age_seconds,
+                name="execution_quote_max_age_seconds",
+            )
+        )
+        if execution_quote_age is not None and execution_quote_age <= 0:
+            raise ValueError(
+                "execution_quote_max_age_seconds must be positive when configured."
+            )
+        entry_open_delay = _strict_positive_int(
+            self.entry_open_delay_seconds,
+            name="entry_open_delay_seconds",
+            minimum=1,
+        )
+        entry_cutoff = _strict_positive_int(
+            self.entry_cutoff_seconds,
+            name="entry_cutoff_seconds",
+            minimum=1,
+        )
+        buy_cancel = _strict_positive_int(
+            self.buy_trail_cancel_seconds,
+            name="buy_trail_cancel_seconds",
+            minimum=1,
+        )
+        boundary_tolerance = finite_nonnegative(
+            self.session_boundary_tolerance_seconds,
+            name="session_boundary_tolerance_seconds",
+        )
+        max_event_gap = finite_nonnegative(
+            self.max_market_event_gap_seconds,
+            name="max_market_event_gap_seconds",
+        )
+        if max_event_gap <= 0:
+            raise ValueError("max_market_event_gap_seconds must be greater than zero.")
+        last_minute_coverage = finite_percentage(
+            self.min_last_event_minute_coverage_pct,
+            name="min_last_event_minute_coverage_pct",
+        )
+        last_gap_p95 = finite_nonnegative(
+            self.max_last_event_gap_p95_seconds,
+            name="max_last_event_gap_p95_seconds",
+        )
+        if last_gap_p95 <= 0:
+            raise ValueError("max_last_event_gap_p95_seconds must be greater than zero.")
+        touch_coverage = finite_percentage(
+            self.min_touch_liquidity_coverage_pct,
+            name="min_touch_liquidity_coverage_pct",
+        )
+        quote_age = finite_nonnegative(
+            self.calibration_max_quote_age_seconds,
+            name="calibration_max_quote_age_seconds",
+        )
+        if quote_age <= 0:
+            raise ValueError(
+                "calibration_max_quote_age_seconds must be greater than zero."
+            )
+        calibration_min_samples = _strict_positive_int(
+            self.calibration_min_samples,
+            name="calibration_min_samples",
+            minimum=1,
+        )
+        calibration_source = (
+            Path(self.calibration_source_dir).expanduser().resolve()
+            if self.calibration_source_dir is not None
+            else None
+        )
+        if calibration_source is not None:
+            if not calibration_source.exists() or not calibration_source.is_dir():
+                raise ValueError(
+                    "calibration_source_dir must be an existing BouncyBot data directory."
+                )
+            if output == calibration_source or calibration_source in output.parents:
+                raise ValueError(
+                    "Market Replay output cannot replace or be nested under the calibration source directory."
+                )
         return MarketReplayConfig(
             recording_path=paths,
             output_root=output,
@@ -117,6 +314,41 @@ class MarketReplayConfig:
             max_recordings=max_recordings,
             min_atr_pct=round(minimum, 4),
             max_atr_pct=round(maximum, 4),
+            assumed_trade_notional=round(assumed_notional, 2),
+            execution_cost_bps_per_side=round(execution_cost, 4),
+            buy_execution_cost_bps_per_side=round(buy_execution_cost, 6),
+            sell_execution_cost_bps_per_side=round(sell_execution_cost, 6),
+            execution_cost_overrides=tuple(sorted(cost_overrides)),
+            trade_notional_overrides=tuple(sorted(notional_overrides)),
+            turnover_penalty_bps_per_completed_trade=round(turnover_penalty, 4),
+            execution_quote_max_age_seconds=(
+                round(execution_quote_age, 3)
+                if execution_quote_age is not None
+                else None
+            ),
+            entry_open_delay_seconds=entry_open_delay,
+            entry_cutoff_seconds=entry_cutoff,
+            buy_trail_cancel_seconds=buy_cancel,
+            session_boundary_tolerance_seconds=round(boundary_tolerance, 3),
+            max_market_event_gap_seconds=round(max_event_gap, 3),
+            min_last_event_minute_coverage_pct=round(last_minute_coverage, 3),
+            max_last_event_gap_p95_seconds=round(last_gap_p95, 3),
+            min_touch_liquidity_coverage_pct=round(touch_coverage, 3),
+            continuous_overnight_replay=_strict_bool(
+                self.continuous_overnight_replay,
+                name="continuous_overnight_replay",
+            ),
+            calibration_source_dir=calibration_source,
+            calibration_max_quote_age_seconds=round(quote_age, 3),
+            calibration_min_samples=calibration_min_samples,
+            calibration_use_execution_cost=_strict_bool(
+                self.calibration_use_execution_cost,
+                name="calibration_use_execution_cost",
+            ),
+            calibration_use_trade_notional=_strict_bool(
+                self.calibration_use_trade_notional,
+                name="calibration_use_trade_notional",
+            ),
         )
 
 
@@ -234,6 +466,17 @@ class IbrecPeriod:
     close_reason: str
     tick_count: int
     source_recording_sha256: str = ""
+    primary_eligible: bool = True
+    source_finalized: bool = True
+    coverage_pct: float = 100.0
+    start_lag_seconds: float = 0.0
+    end_lead_seconds: float = 0.0
+    maximum_event_gap_seconds: float = 0.0
+    connectivity_event_count: int = 0
+    last_event_count: int = 0
+    last_event_minute_coverage_pct: float = 100.0
+    last_event_gap_p95_seconds: float | None = None
+    quality_exclusion_reasons: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -255,6 +498,7 @@ class IbrecRecording:
     data_start_utc: str
     data_end_utc: str
     excluded_sessions: list[dict[str, Any]] = field(default_factory=list)
+    quality_events: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def symbol(self) -> str:
@@ -262,18 +506,17 @@ class IbrecRecording:
 
     @property
     def con_id(self) -> int:
-        try:
-            return max(0, int(self.contract.get("con_id", self.contract.get("conId", 0)) or 0))
-        except (TypeError, ValueError, OverflowError):
-            return 0
+        value = finite_int(
+            self.contract.get("con_id", self.contract.get("conId", 0))
+        )
+        return max(0, value or 0)
 
     @property
     def min_tick(self) -> float:
-        try:
-            value = float(self.contract.get("min_tick", self.contract.get("minTick", 0.01)) or 0.01)
-        except (TypeError, ValueError, OverflowError):
-            value = 0.01
-        return value if math.isfinite(value) and value > 0 else 0.01
+        value = finite_float(
+            self.contract.get("min_tick", self.contract.get("minTick"))
+        )
+        return value if value is not None and value > 0 else 0.01
 
     @property
     def logical_file_name(self) -> str:
@@ -295,11 +538,11 @@ class IbrecRecording:
 
     @property
     def format_versions(self) -> tuple[int, ...]:
-        values = {
-            int(component.get("format_version") or 0)
-            for component in self.input_components
-            if int(component.get("format_version") or 0) in {2, 3}
-        }
+        values: set[int] = set()
+        for component in self.input_components:
+            version = finite_int(component.get("format_version"))
+            if version in {2, 3}:
+                values.add(version)
         if not values and self.format_version in {2, 3}:
             values.add(self.format_version)
         return tuple(sorted(values))
@@ -357,6 +600,15 @@ class MarketReplayTrade:
     minimum_profit_pct: float | None = None
     sell_trigger_pct: float | None = None
     open_at_end: bool = False
+    assumed_quantity: int = 0
+    buy_touch_size: float | None = None
+    sell_touch_size: float | None = None
+    buy_touch_sufficient: bool | None = None
+    sell_touch_sufficient: bool | None = None
+    gross_return_bps: float | None = None
+    net_return_bps: float | None = None
+    sell_session_date: str = ""
+    overnight_sessions_held: int = 0
 
 
 @dataclass(slots=True)
@@ -376,12 +628,53 @@ class MarketReplaySessionResult:
     marked_return_bps: float
     conservative_return_bps: float
     max_drawdown_bps: float
+    session_max_drawdown_bps: float = 0.0
+    chain_max_drawdown_bps: float = 0.0
     first_entry_utc: str = ""
     last_exit_utc: str = ""
     open_entry_setup: bool = False
     right_censored: bool = False
     unmarked_open_position: bool = False
+    primary_eligible: bool = True
+    source_finalized: bool = True
+    coverage_pct: float = 0.0
+    start_lag_seconds: float = 0.0
+    end_lead_seconds: float = 0.0
+    maximum_event_gap_seconds: float = 0.0
+    connectivity_event_count: int = 0
+    last_event_count: int = 0
+    last_event_minute_coverage_pct: float = 0.0
+    last_event_gap_p95_seconds: float | None = None
+    touch_liquidity_checks: int = 0
+    touch_liquidity_sufficient_checks: int = 0
+    touch_liquidity_coverage_pct: float | None = None
+    assumed_trade_notional: float = 0.0
+    execution_cost_bps_per_side: float = 0.0
+    buy_execution_cost_bps_per_side: float = 0.0
+    sell_execution_cost_bps_per_side: float = 0.0
+    total_execution_cost_bps: float = 0.0
+    clamp_min_count: int = 0
+    clamp_max_count: int = 0
+    clamp_raw_count: int = 0
+    clamp_zero_count: int = 0
+    clamp_total_count: int = 0
+    clamp_min_rate_pct: float = 0.0
+    clamp_max_rate_pct: float = 0.0
+    clamp_component_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    clamp_component_rates_pct: dict[str, dict[str, float]] = field(default_factory=dict)
     issues: list[str] = field(default_factory=list)
+    continuity_chain_id: int = 0
+    continuity_broken_before: bool = False
+    continuity_break_reason: str = ""
+    carried_position_in: bool = False
+    carried_position_out: bool = False
+    carried_sell_trail_in: bool = False
+    carried_sell_trail_out: bool = False
+    terminal_open_position: bool = False
+    session_start_equity: float = 1.0
+    session_end_equity: float = 1.0
+    cumulative_end_equity: float = 1.0
+    overnight_gap_return_bps: float | None = None
 
 
 @dataclass(slots=True)
@@ -414,6 +707,8 @@ class MarketReplayCandidateSummary:
     robustness_passed: bool = False
     control_score_delta: float | None = None
     paired_trading_days: int = 0
+    bootstrap_unit_type: str = "trading_day"
+    bootstrap_independent_units: int = 0
     bootstrap_replicates: int = 0
     bootstrap_ci80_low: float | None = None
     bootstrap_ci80_high: float | None = None
@@ -433,6 +728,7 @@ class MarketReplayCandidateSummary:
     leave_one_day_out_exact_profile_selection_pct: float | None = None
     leave_one_day_out_same_window_selections: int = 0
     leave_one_day_out_same_window_selection_pct: float | None = None
+    leave_one_day_out_selection_mode: str = ""
     paired_median_return_delta_bps: float | None = None
     paired_positive_day_pct: float | None = None
     control_trade_day_retention_pct: float | None = None
@@ -441,6 +737,49 @@ class MarketReplayCandidateSummary:
     atr_phase_cases: int = 0
     atr_phase_min_score_delta: float | None = None
     atr_phase_adverse_score_delta: float | None = None
+    average_completed_trades_per_session: float = 0.0
+    turnover_penalty_points: float = 0.0
+    total_execution_cost_bps: float = 0.0
+    touch_liquidity_checks: int = 0
+    touch_liquidity_sufficient_checks: int = 0
+    touch_liquidity_coverage_pct: float | None = None
+    clamp_min_count: int = 0
+    clamp_max_count: int = 0
+    clamp_raw_count: int = 0
+    clamp_zero_count: int = 0
+    clamp_total_count: int = 0
+    clamp_min_rate_pct: float = 0.0
+    clamp_max_rate_pct: float = 0.0
+    clamp_component_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    clamp_component_rates_pct: dict[str, dict[str, float]] = field(default_factory=dict)
+    primary_eligible_sessions: int = 0
+    excluded_quality_sessions: int = 0
+    moving_block_replicates: int = 0
+    moving_block_length: int = 0
+    moving_block_ci80_low: float | None = None
+    moving_block_ci80_high: float | None = None
+    moving_block_probability_positive_pct: float | None = None
+    selection_bootstrap_replicates: int = 0
+    selection_bootstrap_oob_evaluations: int = 0
+    selection_bootstrap_probability_positive_pct: float | None = None
+    selection_bootstrap_median_oob_delta: float | None = None
+    selection_bootstrap_control_selection_pct: float | None = None
+    walk_forward_folds: int = 0
+    walk_forward_positive_folds: int = 0
+    walk_forward_probability_positive_pct: float | None = None
+    walk_forward_median_delta: float | None = None
+    walk_forward_worst_delta: float | None = None
+    walk_forward_same_window_pct: float | None = None
+    score_policy_results: list[dict[str, Any]] = field(default_factory=list)
+    score_policy_all_positive: bool = False
+    pareto_frontier: bool = False
+    pareto_dominated_by: list[str] = field(default_factory=list)
+    boundary_dimensions: list[str] = field(default_factory=list)
+    boundary_extension_attempted: bool = False
+    boundary_resolved: bool = False
+    assumption_stress_results: list[dict[str, Any]] = field(default_factory=list)
+    assumption_stress_all_positive: bool = False
+    recommendation_gates: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -467,6 +806,19 @@ class MarketReplayAnalysisResult:
     window_search: list[dict[str, Any]] = field(default_factory=list)
     robustness_evidence: list[dict[str, Any]] = field(default_factory=list)
     recommendation_leave_one_day_out: list[dict[str, Any]] = field(default_factory=list)
+    session_quality: list[dict[str, Any]] = field(default_factory=list)
+    execution_calibration: dict[str, Any] = field(default_factory=dict)
+    continuity_evidence: list[dict[str, Any]] = field(default_factory=list)
+    continuity_block_evidence: list[dict[str, Any]] = field(default_factory=list)
+    score_policy_evidence: list[dict[str, Any]] = field(default_factory=list)
+    moving_block_evidence: list[dict[str, Any]] = field(default_factory=list)
+    selection_bootstrap_evidence: list[dict[str, Any]] = field(default_factory=list)
+    walk_forward_evidence: list[dict[str, Any]] = field(default_factory=list)
+    pareto_evidence: list[dict[str, Any]] = field(default_factory=list)
+    boundary_evidence: list[dict[str, Any]] = field(default_factory=list)
+    assumption_stress_evidence: list[dict[str, Any]] = field(default_factory=list)
+    recommendation_gates: list[dict[str, Any]] = field(default_factory=list)
+    exploratory_only: bool = False
     files_written: list[Path] = field(default_factory=list)
 
     def to_jsonable(self) -> dict[str, Any]:
@@ -510,6 +862,19 @@ class MarketReplayAnalysisResult:
             "window_search": self.window_search,
             "robustness_evidence": self.robustness_evidence,
             "recommendation_leave_one_day_out": self.recommendation_leave_one_day_out,
+            "session_quality": self.session_quality,
+            "execution_calibration": self.execution_calibration,
+            "continuity_evidence": self.continuity_evidence,
+            "continuity_block_evidence": self.continuity_block_evidence,
+            "score_policy_evidence": self.score_policy_evidence,
+            "moving_block_evidence": self.moving_block_evidence,
+            "selection_bootstrap_evidence": self.selection_bootstrap_evidence,
+            "walk_forward_evidence": self.walk_forward_evidence,
+            "pareto_evidence": self.pareto_evidence,
+            "boundary_evidence": self.boundary_evidence,
+            "assumption_stress_evidence": self.assumption_stress_evidence,
+            "recommendation_gates": self.recommendation_gates,
+            "exploratory_only": self.exploratory_only,
             "files_written": [
                 path.relative_to(self.output_dir).as_posix()
                 if path.is_absolute() and self.output_dir in path.parents

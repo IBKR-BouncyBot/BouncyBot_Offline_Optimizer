@@ -64,7 +64,9 @@ def _sha256(path: Path) -> str:
 def test_market_replay_uses_three_stage_two_dimensional_window_search(
     tmp_path: Path,
 ) -> None:
-    ticks, periods = make_ticks(sessions=5)
+    ticks, periods = make_ticks(sessions=5, points_per_session=140)
+    for period in periods:
+        period["close_reason"] = "contract_liquid_hours"
     recording = write_v3(tmp_path / "week.ibrec", ticks, periods)
     result = run_market_replay_analysis(
         MarketReplayConfig(recording, tmp_path / "reports")
@@ -99,10 +101,16 @@ def test_market_replay_uses_three_stage_two_dimensional_window_search(
     selected_windows = {(row["period"], row["bar_seconds"]) for row in stage3}
     assert len(selected_windows) == 3
     assert (14, 60) in selected_windows
-    assert {
+    candidate_windows = {
         (candidate.profile.period, candidate.profile.bar_seconds)
         for candidate in result.candidates
-    }.issubset(selected_windows)
+    }
+    assert selected_windows.issubset(candidate_windows)
+    # v1.9 may add deterministic outward probes when a stable region touches
+    # the staged search boundary. Those probes are evidence candidates, not a
+    # fourth Stage-2 winner.
+    if candidate_windows - selected_windows:
+        assert result.boundary_evidence
     assert result.recommendation.leave_one_day_out_selection_runs == 5
     assert (
         result.recommendation.leave_one_day_out_same_window_selection_pct
@@ -148,7 +156,7 @@ def test_market_replay_centers_share_one_candidate_independent_bootstrap_schedul
     other_recording = _market_replay_bootstrap_seed("b" * 64, CONTROL)
     assert first == second
     assert first != other_recording
-    assert "shared-trading-day-bootstrap" in first
+    assert "shared-day-or-continuity-block-bootstrap" in first
 
 
 def test_large_near_best_multiplier_plateau_is_one_stable_region() -> None:
@@ -446,7 +454,7 @@ def test_release_lock_gitignore_license_and_build_contracts() -> None:
 
     build = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
     assert '$requiredPythonVersion = "3.11.9"' in build
-    assert '$sourceDateEpoch = "1784592000"' in build
+    assert '$sourceDateEpoch = "1785024000"' in build
     assert "requirements-release-win64.lock" in build
     assert "--no-deps" in build
     assert "--only-binary=:all:" in build

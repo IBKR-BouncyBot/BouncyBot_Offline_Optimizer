@@ -322,6 +322,7 @@ def test_report_contains_explanations_and_all_evidence_files(tmp_path: Path) -> 
         "market_replay_analysis.json",
         "input_recordings.csv",
         "excluded_sessions.csv",
+            "session_quality.csv",
         "atr_window_search.csv",
         "candidate_results.csv",
         "robustness_evidence.csv",
@@ -330,6 +331,17 @@ def test_report_contains_explanations_and_all_evidence_files(tmp_path: Path) -> 
         "recommended_session_results.csv",
         "recommended_simulated_trades.csv",
         "control_session_results.csv",
+        "execution_calibration.csv",
+        "continuity_evidence.csv",
+        "continuity_block_evidence.csv",
+        "score_policy_evidence.csv",
+        "moving_block_evidence.csv",
+        "selection_bootstrap_evidence.csv",
+        "walk_forward_evidence.csv",
+        "pareto_frontier.csv",
+        "search_boundary_evidence.csv",
+        "assumption_stress_evidence.csv",
+        "recommendation_quality_gates.csv",
         "data_quality_issues.csv",
         "README_REPORT.txt",
         "analysis_manifest.json",
@@ -347,6 +359,8 @@ def test_report_contains_explanations_and_all_evidence_files(tmp_path: Path) -> 
     assert "three-stage two-dimensional" in text.lower()
     assert "trading-day bootstrap" in text.lower()
     assert "leave-one-day-out" in text.lower()
+    assert "selection-aware bootstrap" in text.lower()
+    assert "chronological walk-forward" in text.lower()
 
 
 def test_report_refuses_to_replace_different_content_at_same_analysis_id(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import statistics
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -51,9 +52,60 @@ def finite_float(value: Any) -> float | None:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def finite_int(value: Any) -> int | None:
+    """Return an exact finite integer without bool or fraction coercion.
+
+    JSON and SQLite can represent integer metadata as ``14``, ``14.0`` or
+    ``"14.0"``.  All three are accepted.  Booleans, fractions, NaN and
+    infinities are rejected so malformed evidence cannot silently change an
+    ATR period, format version, sequence, or contract identifier.
+    """
+
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # Beyond 2**53 a binary float cannot represent every integer. Reject
+        # that input form rather than silently accepting a rounded identifier,
+        # sequence, byte limit, or ATR period. Large exact values remain
+        # available through integer, Decimal, or string input.
+        if (
+            not math.isfinite(value)
+            or not value.is_integer()
+            or abs(value) > 2**53
+        ):
+            return None
+        return int(value)
+    if isinstance(value, Decimal):
+        number = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = Decimal(text)
+        except InvalidOperation:
+            return None
+    else:
+        return None
+    if (
+        not number.is_finite()
+        or number != number.to_integral_value()
+        # Avoid an attacker-controlled exponent causing an enormous integer
+        # allocation while parsing untrusted manifest or SQLite metadata.
+        or number.adjusted() > 100
+    ):
+        return None
+    try:
+        return int(number)
+    except (OverflowError, ValueError):
+        return None
 
 
 def truthy(value: Any, *, default: bool = False) -> bool:

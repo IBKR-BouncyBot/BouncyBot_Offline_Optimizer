@@ -7,12 +7,13 @@ report-path rule testable in environments that do not have a GUI runtime.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .models import TickerAnalysis
-from .utils import finite_float, ticker_folder_name
+from .utils import finite_float, finite_int, ticker_folder_name
 
 
 @dataclass(slots=True, frozen=True)
@@ -70,6 +71,61 @@ RESULT_COLUMNS = (
         "Open the detailed deterministic HTML report for this ticker.",
     ),
 )
+
+
+_IBREC_CONTAINER_LABELS = {
+    "sqlite": "SQLite",
+    "zip": "ZIP",
+}
+
+
+def market_replay_format_label(details: Mapping[str, Any]) -> str:
+    """Return a concise human-readable label for verified .ibrec inputs.
+
+    ``inspect_ibrec_set`` returns one record per selected file, which is the
+    authoritative source for matching a format version to its container.  The
+    aggregate ``format_versions`` and ``containers`` fields are used only as a
+    defensive fallback so the GUI does not regress to an opaque list such as
+    ``[3]`` if a caller supplies a reduced summary.
+    """
+
+    labels: set[tuple[int, str]] = set()
+    recordings = details.get("recordings")
+    if isinstance(recordings, (list, tuple)):
+        for recording in recordings:
+            if not isinstance(recording, Mapping):
+                continue
+            version = finite_int(recording.get("format_version"))
+            container = str(recording.get("container_format") or "").strip().lower()
+            if version in {2, 3} and container in _IBREC_CONTAINER_LABELS:
+                labels.add((version, container))
+
+    if not labels:
+        versions_raw = details.get("format_versions")
+        versions: set[int] = set()
+        if isinstance(versions_raw, (list, tuple, set, frozenset)):
+            for value in versions_raw:
+                version = finite_int(value)
+                if version in {2, 3}:
+                    versions.add(version)
+        containers_raw = details.get("containers")
+        containers: set[str] = set()
+        if isinstance(containers_raw, (list, tuple, set, frozenset)):
+            for value in containers_raw:
+                container = str(value).strip().lower()
+                if container in _IBREC_CONTAINER_LABELS:
+                    containers.add(container)
+        for version in versions:
+            expected = "zip" if version == 2 else "sqlite"
+            if not containers or expected in containers:
+                labels.add((version, expected))
+
+    if not labels:
+        return "unknown .ibrec format"
+    return " / ".join(
+        f"v{version} {_IBREC_CONTAINER_LABELS[container]}"
+        for version, container in sorted(labels)
+    )
 
 
 def _percent(value: Any) -> str:
