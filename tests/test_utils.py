@@ -5,6 +5,7 @@ from pathlib import Path
 
 from optimizer.utils import (
     finite_float,
+    finite_int,
     iso_from_timestamp,
     mean,
     median,
@@ -30,6 +31,9 @@ def test_datetime_and_numeric_helpers() -> None:
     assert finite_float(True) is None
     assert finite_float("bad") is None
     assert finite_float("inf") is None
+    assert finite_int("14.0") == 14
+    assert finite_int("14.5") is None
+    assert finite_int(True) is None
 
 
 def test_boolean_and_statistics_helpers() -> None:

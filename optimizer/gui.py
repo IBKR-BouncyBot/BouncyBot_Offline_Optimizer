@@ -12,6 +12,8 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -36,9 +38,19 @@ from .market_replay import run_market_replay_analysis
 from .market_replay_models import MarketReplayAnalysisResult, MarketReplayConfig
 from .market_replay_reports import write_market_replay_report
 from .models import AnalysisConfig, AnalysisResult
-from .presentation import RESULT_COLUMNS, result_cells, ticker_report_path
+from .presentation import (
+    RESULT_COLUMNS,
+    market_replay_format_label,
+    result_cells,
+    ticker_report_path,
+)
 from .reports import write_reports
-from .safety import SourceSafetyError, source_paths, validate_source
+from .safety import (
+    SourceSafetyError,
+    source_paths,
+    validate_database_source,
+    validate_source,
+)
 from .version import APP_NAME, APP_VERSION
 
 
@@ -169,6 +181,7 @@ class MainWindow(QMainWindow):
         output_row.addWidget(self.output_edit)
         output_row.addWidget(self.output_button)
         form.addRow("Report output root", output_row)
+
         layout.addLayout(form)
 
         status_row = QHBoxLayout()
@@ -213,7 +226,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(self.replay_tab)
         explanation = QLabel(
             "This separate workflow reads one or more Market Replay Lab .ibrec format-v2 ZIP or format-v3 SQLite recordings for the same instrument. "
-            "It does not read BouncyBot SQLite/captures, does not acquire the trading-bot lock, and does not connect to IBKR."
+            "By default it carries open positions and active SELL trails across provably consecutive complete RTH recordings. "
+            "Optionally, a stopped BouncyBot data folder can calibrate the assumed notional and conservative execution-cost reserve from actual executions. "
+            "It never connects to IBKR or writes to the BouncyBot database."
         )
         explanation.setWordWrap(True)
         explanation.setStyleSheet("padding: 10px; background: #eef6ff; border: 1px solid #2c6fb7;")
@@ -256,6 +271,65 @@ class MainWindow(QMainWindow):
         output_row.addWidget(self.replay_output_edit)
         output_row.addWidget(self.replay_output_button)
         form.addRow("Report output root", output_row)
+
+        calibration_row = QHBoxLayout()
+        self.calibration_source_edit = QLineEdit("")
+        self.calibration_source_edit.setPlaceholderText(
+            "Optional folder containing bot_state.sqlite"
+        )
+        self.calibration_source_button = QPushButton("Browse…")
+        self.calibration_source_button.clicked.connect(self._browse_calibration_source)
+        self.calibration_source_clear_button = QPushButton("Clear")
+        self.calibration_source_clear_button.clicked.connect(
+            self._clear_calibration_source
+        )
+        calibration_row.addWidget(self.calibration_source_edit)
+        calibration_row.addWidget(self.calibration_source_button)
+        calibration_row.addWidget(self.calibration_source_clear_button)
+        form.addRow("Optional execution calibration", calibration_row)
+
+        self.overnight_replay_checkbox = QCheckBox(
+            "Carry open long positions and active SELL trails across consecutive RTH recordings"
+        )
+        self.overnight_replay_checkbox.setChecked(True)
+        self.overnight_replay_checkbox.setToolTip(
+            "Continuity is used only when adjacent sessions are complete, primary-eligible, and the next weekday recording is present. Gaps fail closed."
+        )
+        form.addRow("Overnight replay", self.overnight_replay_checkbox)
+
+        self.ibrec_notional_spin = QDoubleSpinBox()
+        self.ibrec_notional_spin.setRange(100.0, 100_000_000.0)
+        self.ibrec_notional_spin.setDecimals(2)
+        self.ibrec_notional_spin.setValue(10_000.0)
+        self.ibrec_notional_spin.setToolTip(
+            "Fixed notional in the recording instrument's currency. It is used only "
+            "to estimate whole-share quantity and whether recorded top-of-book size was "
+            "sufficient; it is not an account-sizing or full partial-fill model."
+        )
+        form.addRow(
+            "Assumed trade notional (instrument currency)",
+            self.ibrec_notional_spin,
+        )
+
+        self.ibrec_cost_spin = QDoubleSpinBox()
+        self.ibrec_cost_spin.setRange(0.0, 100.0)
+        self.ibrec_cost_spin.setDecimals(4)
+        self.ibrec_cost_spin.setValue(1.0)
+        self.ibrec_cost_spin.setSuffix(" bps / side")
+        self.ibrec_cost_spin.setToolTip(
+            "Fixed conservative execution-cost reserve charged on every modeled BUY and SELL side."
+        )
+        form.addRow("Execution-cost reserve", self.ibrec_cost_spin)
+
+        self.ibrec_turnover_spin = QDoubleSpinBox()
+        self.ibrec_turnover_spin.setRange(0.0, 100.0)
+        self.ibrec_turnover_spin.setDecimals(4)
+        self.ibrec_turnover_spin.setValue(0.25)
+        self.ibrec_turnover_spin.setSuffix(" score bps / trade")
+        self.ibrec_turnover_spin.setToolTip(
+            "Additional screening-score penalty per completed cycle to discourage turnover-driven zero-trail profiles."
+        )
+        form.addRow("Turnover penalty", self.ibrec_turnover_spin)
         layout.addLayout(form)
 
         status_row = QHBoxLayout()
@@ -375,6 +449,26 @@ class MainWindow(QMainWindow):
             self.replay_output_edit.setText(chosen)
 
     @Slot()
+    def _browse_calibration_source(self) -> None:
+        if self._busy:
+            return
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Select stopped BouncyBot data folder for execution calibration",
+            self.calibration_source_edit.text(),
+        )
+        if chosen:
+            self.calibration_source_edit.setText(chosen)
+            self._check_ibrec()
+
+    @Slot()
+    def _clear_calibration_source(self) -> None:
+        if self._busy:
+            return
+        self.calibration_source_edit.clear()
+        self._check_ibrec()
+
+    @Slot()
     def _check_source(self) -> bool:
         try:
             paths = source_paths(Path(self.source_edit.text()))
@@ -401,13 +495,12 @@ class MainWindow(QMainWindow):
             self.ibrec_analyze_button.setEnabled(False)
             return False
         try:
-            details = inspect_ibrec_set(
-                MarketReplayConfig(
-                    recording_path=paths,
-                    output_root=Path(self.replay_output_edit.text() or "."),
-                )
-            )
-        except (IbrecError, OSError, ValueError) as exc:
+            config = self._market_replay_config(paths)
+            details = inspect_ibrec_set(config)
+            if config.calibration_source_dir is not None:
+                calibration_paths = source_paths(config.calibration_source_dir)
+                validate_database_source(calibration_paths)
+        except (IbrecError, OSError, SourceSafetyError, ValueError) as exc:
             self.ibrec_preflight_label.setText(f"Blocked: {exc}")
             self.ibrec_preflight_label.setStyleSheet("color: #a00000;")
             self.ibrec_analyze_button.setEnabled(False)
@@ -415,8 +508,11 @@ class MainWindow(QMainWindow):
         qualifiers = [f"{details['recording_count']} recording(s)"]
         if details.get("synthetic"):
             qualifiers.append("synthetic sample")
+        if config.calibration_source_dir is not None:
+            qualifiers.append("read-only SQLite calibration ready")
+        format_label = market_replay_format_label(details)
         self.ibrec_preflight_label.setText(
-            f"Ready: {details['symbol']} · format(s) {details['format_versions']} · "
+            f"Ready: {details['symbol']} · {format_label} · "
             f"{details['row_count']:,} rows · {' · '.join(qualifiers)}"
         )
         self.ibrec_preflight_label.setStyleSheet(
@@ -424,6 +520,27 @@ class MainWindow(QMainWindow):
         )
         self.ibrec_analyze_button.setEnabled(not self._busy)
         return True
+
+    def _market_replay_config(
+        self,
+        paths: tuple[Path, ...] | None = None,
+    ) -> MarketReplayConfig:
+        selected = paths if paths is not None else self._selected_ibrec_paths()
+        return MarketReplayConfig(
+            recording_path=selected,
+            output_root=Path(self.replay_output_edit.text() or "."),
+            assumed_trade_notional=self.ibrec_notional_spin.value(),
+            execution_cost_bps_per_side=self.ibrec_cost_spin.value(),
+            turnover_penalty_bps_per_completed_trade=(
+                self.ibrec_turnover_spin.value()
+            ),
+            continuous_overnight_replay=self.overnight_replay_checkbox.isChecked(),
+            calibration_source_dir=(
+                Path(self.calibration_source_edit.text()).expanduser()
+                if self.calibration_source_edit.text().strip()
+                else None
+            ),
+        )
 
     @Slot()
     def _start_analysis(self) -> None:
@@ -459,12 +576,35 @@ class MainWindow(QMainWindow):
         # target and silently bypassing the safety check.
         sources = self._selected_ibrec_paths()
         output = Path(self.replay_output_edit.text()).expanduser().resolve()
+        config = self._market_replay_config(sources)
+        calibration_text = (
+            "No BouncyBot database will be read and no bot lock is required."
+            if config.calibration_source_dir is None
+            else (
+                "Confirm that BouncyBot is fully closed. The optimizer will temporarily acquire "
+                "ibkr_trading_bot.lock, copy SQLite/WAL through read-only file access into a private "
+                "snapshot, derive ticker-specific execution-cost/notional evidence, and release only "
+                "the lock it created. It will not write to the trading database.\n"
+                f"Calibration folder: {config.calibration_source_dir}"
+            )
+        )
+        overnight_text = (
+            "Enabled: open long positions and active native SELL trails may continue only across "
+            "provably consecutive, complete, primary-eligible RTH recordings."
+            if config.continuous_overnight_replay
+            else "Disabled: every RTH recording starts flat."
+        )
         answer = QMessageBox.question(
             self,
             "Confirm Market Replay optimization",
             "The optimizer will copy and verify the selected .ibrec recordings, combine only unambiguous trading dates, evaluate the bounded ATR grid, and "
-            "write a separate deterministic report. It will not read BouncyBot SQLite/captures, acquire the bot lock, "
-            f"or connect to IBKR.\n\nRecordings: {len(sources)}\nOutput: {output}\n\nContinue?",
+            "write a separate deterministic report. It will never connect to IBKR.\n\n"
+            f"{calibration_text}\n\n"
+            f"Overnight replay: {overnight_text}\n\n"
+            f"Recordings: {len(sources)}\nOutput: {output}\n"
+            f"Assumed notional: {self.ibrec_notional_spin.value():,.2f}\n"
+            f"Execution-cost reserve: {self.ibrec_cost_spin.value():.4f} bps per side\n"
+            f"Turnover penalty: {self.ibrec_turnover_spin.value():.4f} score points per completed trade\n\nContinue?",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -475,7 +615,7 @@ class MainWindow(QMainWindow):
         self.ibrec_table.setRowCount(0)
         self.ibrec_progress_label.setText("Starting Market Replay analysis…")
         self.ibrec_progress_bar.setRange(0, 0)
-        self._start_worker(MarketReplayWorker(MarketReplayConfig(sources, output)))
+        self._start_worker(MarketReplayWorker(config))
 
     def _start_worker(self, worker: QObject) -> None:
         thread = QThread(self)
@@ -508,6 +648,13 @@ class MainWindow(QMainWindow):
             self.ibrec_clear_button,
             self.replay_output_button,
             self.ibrec_check_button,
+            self.ibrec_notional_spin,
+            self.ibrec_cost_spin,
+            self.ibrec_turnover_spin,
+            self.calibration_source_edit,
+            self.calibration_source_button,
+            self.calibration_source_clear_button,
+            self.overnight_replay_checkbox,
         ):
             widget.setEnabled(enabled)
         self.analyze_button.setEnabled(enabled and self.preflight_label.text().startswith("Ready:"))

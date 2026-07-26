@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_is_consistent_across_release_files() -> None:
-    assert APP_VERSION == "1.6.0"
+    assert APP_VERSION == "1.9.2"
     assert APP_NAME == "BouncyBot Offline Optimizer"
     for relative in [
         "pyproject.toml",
@@ -25,7 +25,7 @@ def test_version_is_consistent_across_release_files() -> None:
         "scripts/build_windows.ps1",
         "scripts/windows_version_info.txt",
         "docs/README.md",
-        "docs/V1_6_0_MULTI_RECORDING_RECOMMENDATION_AUDIT.md",
+        "docs/V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md",
     ]:
         assert APP_VERSION in (ROOT / relative).read_text(encoding="utf-8-sig")
 
@@ -71,11 +71,51 @@ def test_version_is_consistent_across_release_files() -> None:
     assert "v1.5.3" in (
         ROOT / "docs/V1_5_3_WINDOWS_PORTABLE_ARCHIVE_AND_SOURCE_AUDIT_FIXES.md"
     ).read_text(encoding="utf-8-sig")
+    assert "v1.8.0" in (
+        ROOT / "docs/V1_8_0_CONTINUOUS_REPLAY_AND_EXECUTION_CALIBRATION.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v1.8.1" in (
+        ROOT / "docs/V1_8_1_RUFF_QUALITY_GATE_CORRECTION.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v1.8.2" in (
+        ROOT / "docs/V1_8_2_PYRIGHT_AND_NUMERIC_EVIDENCE_HARDENING.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v1.9.0" in (
+        ROOT / "docs/V1_9_0_ROBUST_SELECTION_VALIDATION.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v1.9.1" in (
+        ROOT / "docs/V1_9_1_RUFF_F841_QUALITY_GATE_CORRECTION.md"
+    ).read_text(encoding="utf-8-sig")
     windows_version = (ROOT / "scripts/windows_version_info.txt").read_text(
         encoding="utf-8-sig"
     )
-    assert "filevers=(1, 6, 0, 0)" in windows_version
-    assert "prodvers=(1, 6, 0, 0)" in windows_version
+    assert "filevers=(1, 9, 2, 0)" in windows_version
+    assert "prodvers=(1, 9, 2, 0)" in windows_version
+
+
+def test_v191_reported_f841_condition_remains_corrected() -> None:
+    source = (ROOT / "tests/test_v190_robust_selection_validation.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_selection_aware_bootstrap_is_deterministic_with_mocked_selector"
+    )
+    assigned_names = {
+        target.id
+        for node in ast.walk(function)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+        for target in (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+    assert "control_profile" not in assigned_names
 
 
 def test_v130_analysis_and_evidence_contracts_are_versioned() -> None:
@@ -91,10 +131,11 @@ def test_v140_market_replay_contract_supports_v2_and_v3(tmp_path: Path) -> None:
     contract = market_replay_search_contract(
         MarketReplayConfig(tmp_path / "recording.ibrec", tmp_path / "reports")
     )
-    assert contract["contract_version"] == 6
+    assert contract["contract_version"] == 13
     assert contract["supported_ibrec_versions"] == [2, 3]
     assert contract["atr_window_search"]["stage_1"]["fixed_period"] == 14
     assert contract["atr_window_search"]["stage_2"]["periods"] == [5, 7, 10, 14, 21, 28]
+    assert contract["bootstrap_replicates"] == 2_000
     assert contract["trading_day_bootstrap_replicates"] == 2_000
     assert "right_censored_session_fraction" in contract["scoring"]
     assert "synthetic source" in contract["evidence_stability_gates"]
@@ -104,6 +145,28 @@ def test_v140_market_replay_contract_supports_v2_and_v3(tmp_path: Path) -> None:
     )
     assert "5-second phase offsets" in contract["atr_clock"]
     assert "recorded non-crossed ask" in contract["fill_model"]
+    assert contract["continuous_overnight_replay"] is True
+    assert contract["selection_aware_bootstrap_replicates"] == 32
+    assert contract["moving_block_bootstrap_replicates"] == 2_000
+    assert contract["minimum_advanced_validation_days"] == 20
+    assert contract["walk_forward"] == {
+        "minimum_training_days": 15,
+        "validation_block_days": 5,
+        "method": (
+            "expanding chronological training windows; profile selection uses training data only, "
+            "then the frozen selected profile is evaluated on the following unseen block"
+        ),
+    }
+    assert {row["key"] for row in contract["score_policies"]} == {
+        "balanced",
+        "drawdown_focused",
+        "return_focused",
+        "cost_stressed",
+    }
+    calibration = contract["execution_calibration"]
+    assert calibration["enabled"] is False
+    assert calibration["maximum_quote_age_seconds"] == 5.0
+    assert calibration["minimum_samples"] == 5
 
 
 def test_gui_contains_lock_check_and_explicit_confirmation() -> None:
@@ -118,7 +181,11 @@ def test_gui_contains_lock_check_and_explicit_confirmation() -> None:
     assert "for widget in (" in source
     assert "widget.setEnabled(enabled)" in source
     assert '"Market Replay (.ibrec v2/v3)"' in source
-    assert "does not acquire the trading-bot lock" in source
+    assert "No BouncyBot database will be read and no bot lock is required" in source
+    assert "temporarily acquire" in source
+    assert "read-only SQLite calibration ready" in source
+    assert "Carry open long positions and active SELL trails across consecutive RTH recordings" in source
+    assert "Optional execution calibration" in source
     assert "inspect_ibrec" in source
     assert "self._selected_ibrec_paths()" in source
     assert "QListWidget" in source

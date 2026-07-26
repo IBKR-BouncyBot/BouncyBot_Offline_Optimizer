@@ -1,6 +1,6 @@
 [project]
 name = "bouncybot-offline-optimizer"
-version = "1.6.0"
+version = "1.9.2"
 description = "Read-only BouncyBot trade-data analysis and standalone Market Replay ATR optimization"
 readme = "README.md"
 license = { file = "LICENSE" }

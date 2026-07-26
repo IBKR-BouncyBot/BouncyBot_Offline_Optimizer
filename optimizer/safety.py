@@ -31,8 +31,15 @@ def source_paths(root: Path) -> SourcePaths:
     )
 
 
-def validate_source(paths: SourcePaths) -> list[str]:
-    """Return non-fatal source warnings; raise for missing required input."""
+def validate_database_source(paths: SourcePaths) -> list[str]:
+    """Validate a stopped BouncyBot folder when only SQLite is required.
+
+    Market Replay execution calibration does not consume ``debug_captures``.
+    Keeping that narrower boundary separate prevents an absent capture folder
+    from being reported as a calibration defect while retaining the same
+    database, symlink, and lock protections as the full bot-data workflow.
+    """
+
     if not paths.root.exists() or not paths.root.is_dir():
         raise SourceSafetyError(f"Source directory does not exist: {paths.root}")
     if not paths.database.exists() or not paths.database.is_file():
@@ -50,6 +57,14 @@ def validate_source(paths: SourcePaths) -> list[str]:
             "The trading-bot lock file exists"
             f"{suffix}: {paths.bot_lock}. Close the bot and confirm the lock is gone before analysis."
         )
+    return []
+
+
+def validate_source(paths: SourcePaths) -> list[str]:
+    """Validate the complete SQLite-and-captures analysis source."""
+
+    validate_database_source(paths)
+    root = paths.root.resolve()
     warnings: list[str] = []
     if not paths.captures.exists():
         warnings.append("Capture directory 'debug_captures' was not found.")

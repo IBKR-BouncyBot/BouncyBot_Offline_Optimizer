@@ -35,7 +35,8 @@ def test_reported_ruff_diagnostics_remain_corrected() -> None:
         if isinstance(node, (ast.Import, ast.ImportFrom))
         for alias in node.names
     }
-    assert {"asdict", "Path", "IbrecError", "mean", "median"}.isdisjoint(imported_names)
+    assert {"asdict", "IbrecError", "mean", "median"}.isdisjoint(imported_names)
+    assert "Path" in imported_names
     assert "control = summaries[control_profile.key()]" not in market_source
 
     safety_source = (ROOT / "tests/test_safety.py").read_text(encoding="utf-8")

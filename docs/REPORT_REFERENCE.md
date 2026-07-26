@@ -121,3 +121,36 @@ A Market Replay report now adds:
 - paired-day, trade-participation, drawdown-tail, unmarked-position, and ATR-phase fields in recommendation and candidate tables.
 
 `recording_count` is the number of selected main recording components. `raw_row_count` includes every validated row across inputs; `retained_row_count` is the strategy-relevant stream for included dates. A changed recommendation must have zero paired right-censored outcomes and zero unmarked open positions. The report's single profile is therefore either a changed profile that passed every authorization gate or the unchanged control accompanied by the failed-gate reasons.
+
+## Market Replay v1.8 continuity and execution-calibration evidence
+
+Version 1.8 adds two report files:
+
+| File | Meaning |
+|---|---|
+| `continuity_evidence.csv` | Per-session continuity-chain identity, break reason, carried-position/trail flags, start/end equity, overnight gap return, terminal state, and overnight holding count. |
+| `execution_calibration.csv` | Read-only BouncyBot SQLite calibration source identity, sample counts, matched/excluded evidence, commission and adverse-slippage percentiles, configured and effective cost/notional assumptions, and warnings. |
+
+The Market Replay JSON exposes the same information under `continuity_evidence` and `execution_calibration`. Absolute calibration paths are excluded from deterministic report identity; source-content fingerprints are retained.
+
+An overnight-linked set of RTH sessions is treated as one bootstrap dependence block. Session rows still remain visible individually, but recommendation authorization does not pretend that days connected by one open position are independent observations.
+
+A calibration result can be **available but not applied**. This occurs when evidence exists but the relevant replacement toggle is disabled or the sample threshold is not met. The report distinguishes configured assumptions, evidence percentiles, effective assumptions, and whether cost or notional changed.
+
+## Version 1.9 Market Replay evidence files
+
+The Market Replay report adds these deterministic files:
+
+| File | Meaning |
+|---|---|
+| `continuity_block_evidence.csv` | Candidate/control economic blocks spanning linked overnight sessions, including compounded return, cross-session drawdown, excursions, gap contribution, censoring, and terminal state |
+| `score_policy_evidence.csv` | Candidate/control score and delta under balanced, drawdown-focused, return-focused, and cost-stressed policies |
+| `moving_block_evidence.csv` | Circular moving-block bootstrap interval, positive probability, block length, and rejection reasons |
+| `selection_bootstrap_evidence.csv` | Training-bag selected profiles and out-of-bag candidate/control deltas for selection-aware bootstrap |
+| `walk_forward_evidence.csv` | Expanding chronological training/validation folds, training-only selection, final-candidate validation, and ATR-window recurrence |
+| `pareto_frontier.csv` | Pareto status and profiles that dominate a candidate across return, risk, participation, turnover, censoring, and cost dimensions |
+| `search_boundary_evidence.csv` | Search dimensions that touched a boundary, outward probes, and whether the region was resolved |
+| `assumption_stress_evidence.csv` | Fixed candidate/control results under execution-cost, quote-age, notional, entry-delay, and entry-cutoff stress |
+| `recommendation_quality_gates.csv` | Canonical required/optional pass/fail decomposition used to authorize or reject the changed profile |
+
+The HTML report derives the displayed balanced score formula from the serialized score-policy contract. `evidence_stable=true` requires every required gate in `recommendation_quality_gates.csv` to pass. Missing walk-forward or selection-aware evidence is a failed authorization gate, not an implicit pass.

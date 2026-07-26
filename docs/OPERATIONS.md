@@ -69,7 +69,11 @@ The preflight shows lifecycle status for every selected recording and flags synt
 
 The portable build bundles `tzdata` so format-2 liquid-hours reconstruction is available on Windows systems without a separate Python installation. Format 3 uses its explicit UTC RTH periods.
 
-This workflow does not require BouncyBot to be closed and does not inspect or create `ibkr_trading_bot.lock`. It does not use `bot_state.sqlite` or `debug_captures` and does not connect to IBKR.
+Without optional calibration, this workflow does not require BouncyBot to be closed and does not inspect or create `ibkr_trading_bot.lock`. It does not use `bot_state.sqlite` or `debug_captures` and does not connect to IBKR.
+
+When **Optional execution calibration** is selected, close BouncyBot first. The optimizer validates the selected folder, requires its normal lock to be absent, and asks for explicit confirmation. It then acquires the same lock only while it fingerprints and privately snapshots `bot_state.sqlite` and any SQLite sidecars. `debug_captures` is not required or read. The lock is released before the Market Replay search. Absolute calibration paths are excluded from the report and deterministic analysis identity.
+
+The **Overnight replay** option is enabled by default. It can carry an open long, active SELL trail, or triggered SELL waiting for a bid only across consecutive primary-eligible recordings. Missing weekdays, ambiguous holidays, overlapping dates, partial/failed-quality sessions, or the absence of a closing bid mark break continuity and terminalize the unresolved position. A HOLD state re-warms ATR in the next session; a SELL trail that was already submitted retains its locked trail state.
 
 Terminal example:
 
@@ -78,6 +82,7 @@ BouncyBotOfflineOptimizer.exe --no-gui --ibrec `
     "D:\Recordings\AAPL_2026-07-13.ibrec" `
     "D:\Recordings\AAPL_2026-07-14.ibrec" `
     "D:\Recordings\AAPL_2026-07-15.ibrec" `
+    --calibration-source-dir "D:\BouncyBot\GUI" `
     --output-dir "D:\Optimizer Reports"
 ```
 
@@ -99,3 +104,9 @@ The release command creates a fresh `.venv-release`, installs `requirements-boot
 It then writes `SOURCE_MANIFEST.json` and `BUILD_PROVENANCE.json`, creates a deterministic release ZIP with normalized path order, timestamps, and host-independent executable metadata, recreates that archive, and requires both ZIP hashes to match. Source-manifest traversal prunes virtual environments and generated/private trees before descent. `-SkipReproducibilityCheck` exists for diagnostics only and must not be used for a published release.
 
 Development commands may use `requirements.txt`; a tagged binary release must use the exact release locks through the build script. Update those locks only as a deliberate release change followed by the complete Windows test, frozen-app smoke, and two-pass reproducibility gate.
+
+## v1.9 validation runtime and interpretation
+
+Exact leave-one-day-out reruns the complete staged selector once per primary trading date. With at least 20 primary-quality sessions, the default analysis also performs expanding walk-forward selection and selection-aware out-of-bag bootstrap. These checks are intentionally more expensive than fixed-profile replay. They are required only for authorizing a changed profile; insufficient evidence produces the unchanged control with explicit failed-gate rows.
+
+Do not interrupt an analysis by deleting partial report directories. The report is published atomically only after all validation files and checksums are complete. Review `recommendation_quality_gates.csv` before transferring any setting to paper trading. A control result means no changed profile passed every gate; it is not proof that the control is optimal.

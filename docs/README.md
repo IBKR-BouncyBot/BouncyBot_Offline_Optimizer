@@ -1,4 +1,4 @@
-# Documentation index — BouncyBot Offline Optimizer v1.6.0
+# Documentation index — BouncyBot Offline Optimizer v1.9.2
 
 - [Architecture](ARCHITECTURE.md)
 - [Operations and portable placement](OPERATIONS.md)
@@ -7,6 +7,12 @@
 - [Report reference](REPORT_REFERENCE.md)
 - [Database compatibility](DATABASE_COMPATIBILITY.md)
 - [Testing](TESTING.md)
+- [v1.9.2 Market Replay preflight and Windows test clarification](V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md)
+- [v1.9.1 Ruff F841 quality-gate correction](V1_9_1_RUFF_F841_QUALITY_GATE_CORRECTION.md)
+- [v1.9.0 robust selection and validation](V1_9_0_ROBUST_SELECTION_VALIDATION.md)
+- [v1.8.2 Pyright and numeric-evidence hardening](V1_8_2_PYRIGHT_AND_NUMERIC_EVIDENCE_HARDENING.md)
+- [v1.8.1 Ruff quality-gate correction](V1_8_1_RUFF_QUALITY_GATE_CORRECTION.md)
+- [v1.8.0 continuous replay and execution calibration](V1_8_0_CONTINUOUS_REPLAY_AND_EXECUTION_CALIBRATION.md)
 - [v1.6.0 multi-recording and recommendation audit](V1_6_0_MULTI_RECORDING_RECOMMENDATION_AUDIT.md)
 - [v1.5.3 Windows portable-archive and source-audit fixes](V1_5_3_WINDOWS_PORTABLE_ARCHIVE_AND_SOURCE_AUDIT_FIXES.md)
 - [v1.5.2 Windows release-gate fixes](V1_5_2_WINDOWS_RELEASE_GATE_FIXES.md)

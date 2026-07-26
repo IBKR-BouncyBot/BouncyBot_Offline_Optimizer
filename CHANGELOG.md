@@ -1,5 +1,82 @@
 # Changelog
 
+## 1.9.2 — 2026-07-26
+
+Market Replay preflight presentation and Windows test clarification release.
+
+- Restored human-readable verified-format labels in the Market Replay preflight: `v2 ZIP`, `v3 SQLite`, or both.
+- Corrected the native PySide6 regression test to check the semantic label case-insensitively and reject the obsolete numeric-list text.
+- Added pure presentation coverage for single-format, mixed-format, duplicate, aggregate-fallback, and unknown-format summaries.
+- Added a source-contract audit that limits runtime skips to the optional PySide6 module and operating-system symbolic-link capability checks.
+- Documented that the six Windows skips are security integration tests blocked by missing symbolic-link privilege, not application failures.
+- Kept ATR reconstruction, search, replay, robustness analysis, calibration, scoring, reporting, and recommendation behavior unchanged.
+
+## 1.9.1 — 2026-07-26
+
+Ruff quality-gate correction release.
+
+- Removed the unused `control_profile` local assignment reported by Ruff 0.16.0 as `F841` in `tests/test_v190_robust_selection_validation.py`.
+- Added a focused source-contract regression that protects the exact correction.
+- Kept ATR calculations, staged search, bootstrap, leave-one-day-out, walk-forward validation, replay, scoring, stable-region selection, calibration, reports, and recommendation behavior unchanged.
+
+## 1.9.0 — 2026-07-26
+
+- Added exact raw-chronology leave-one-day-out reselection across all three ATR-search stages.
+- Added expanding chronological walk-forward validation on unseen session blocks.
+- Added deterministic selection-aware out-of-bag and circular moving-block bootstrap analysis.
+- Added separate BUY/SELL p50, p75, and p90 execution calibration with date-cross-fitted assumptions.
+- Single-sourced balanced scoring and added drawdown-focused, return-focused, and cost-stressed policy checks.
+- Added Pareto-frontier rejection, search-boundary extension, deterministic assumption stress, and overnight economic-block evidence.
+- Added named recommendation-quality gates and new HTML, JSON, and CSV evidence exports.
+- Increased the Market Replay analysis contract to version 13 and added focused regression/property tests.
+
+## 1.8.2 — 2026-07-25
+
+Pyright and numeric-evidence hardening release.
+
+- Corrected the ten optional numeric-conversion diagnostics reported by the native Windows Pyright 1.1.411 gate.
+- Pinned Pyright 1.1.411 in the normal and reproducible Windows validation environments.
+- Added shared exact finite-integer parsing and reused the existing finite-float boundary across database, model, recording, and quality code.
+- Rejected Boolean, fractional, non-finite, overflowing, precision-losing, and pathological-exponent values at untrusted numeric boundaries.
+- Required validated Market Replay contracts to contain a finite positive minimum tick instead of silently substituting a cent.
+- Prevented fractional broker error codes from being truncated into connectivity codes.
+- Prevented unknown component provenance from inheriting format-3 finalization behavior.
+- Corrected text `false` connectivity evidence and configuration flags so they cannot become true through generic Python truthiness.
+- Added regression coverage for every reported Pyright site and the additional numeric, provenance, and configuration cases found during the audit.
+- Kept ATR calculations, staged search, continuous overnight replay, SQLite execution calibration, bootstrap, leave-one-day-out, scoring, stable-region selection, and recommendation behavior unchanged for valid inputs.
+
+## 1.8.1 — 2026-07-25
+
+Ruff quality-gate correction release.
+
+- Corrected the five Ruff diagnostics reported by the native Windows v1.8.0 quality gate.
+- Normalized import ordering in the GUI, reproducible-ZIP helper, and continuous-replay/calibration tests.
+- Removed one unused type import and one unused leave-one-day-out local assignment.
+- Pinned Ruff 0.16.0 in both normal and reproducible Windows dependency sets so the validated ruleset cannot drift between runs.
+- Added regression coverage for the exact reported source conditions and the Ruff pin.
+- Kept ATR calculations, staged search, continuous overnight replay, execution calibration, robustness analysis, scoring, stable-region selection, and recommendation behavior unchanged.
+
+## 1.8.0 — 2026-07-25
+
+Continuous overnight replay, actual-execution calibration, and real-recording methodology hardening release.
+
+- Added default continuous replay of open long positions and already-submitted SELL trails across provably consecutive primary-eligible RTH recordings.
+- Preserved modeled BUY basis, quantity, cumulative equity, continuity-chain drawdown, locked SELL trail, running high, pending bid-side fill, and detailed trade identity across supported boundaries.
+- Re-warmed ATR after an overnight HOLD before deriving an unsubmitted normal SELL; kept already-submitted SELL trail parameters locked.
+- Broke continuity conservatively on missing weekdays or ambiguous holidays, partial or failed-quality sessions, overlaps, absent closing bid marks, and disabled overnight mode.
+- Added `continuity_evidence.csv` plus per-session and per-trade overnight/chain evidence.
+- Added optional read-only execution calibration from a stopped BouncyBot `bot_state.sqlite` folder without requiring `debug_captures`.
+- Preferred exact conId/currency cycle identity; used legacy ticker fallback only when no exact cycle was available.
+- Derived broker-order commission, no-future same-side quote slippage, combined adverse-cost percentiles, and median actual BUY notional from deduplicated executions.
+- Added cycle-level commission fallback for execution rows whose row-level commission was absent or less authoritative, without double-counting mirrored normal/protective SELL totals.
+- Applied only supported calibration evidence, retained configured floors and values when sample counts were insufficient, and excluded incompatible commission currencies.
+- Added GUI and CLI controls for the calibration folder, sample count, quote age, cost/notional replacement, and overnight replay.
+- Added deterministic `execution_calibration.csv`; calibration content hashes, not absolute paths, participate in analysis identity.
+- Incorporated the real-recording audit improvements developed after v1.6.0: primary session-quality gates, connectivity and Last-density evidence, top-of-book size checks, execution-cost and turnover penalties, clamp-saturation diagnostics, minimum-clamp search, representative window-screen mini-grids, and exploratory short-circuiting below the robust-day threshold.
+- Added regression coverage for overnight exits, active trails, Friday-to-Monday continuity, missing-day breaks, ATR re-warm, pending fills, chain drawdown, source-lock safety, exact contract matching, quote chronology, commission currency, cycle-level commission fallback, path-independent calibration reports, and SQLite-only calibration folders.
+- Made bootstrap resampling continuity-aware: flat outcomes remain trading-day units, while days linked by an overnight position or active SELL order form one indivisible block; changed recommendations require at least five independent units.
+- Replayed candidate and control exactly after each omitted day and blocked changed selection when overnight-linked stage-search stability cannot be established exactly from omission-specific search evidence.
+
 ## 1.6.0 — 2026-07-21
 
 Multi-recording Market Replay and recommendation-soundness release.

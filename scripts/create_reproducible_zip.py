@@ -9,7 +9,6 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
-
 _EXECUTABLE_BINARY_SUFFIXES = {".com", ".exe"}
 
 

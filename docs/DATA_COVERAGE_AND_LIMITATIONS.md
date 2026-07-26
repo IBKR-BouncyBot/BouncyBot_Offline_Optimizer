@@ -108,7 +108,7 @@ Synthetic samples are suitable for software validation, not ticker-setting evide
 
 The `.ibrec` workflow improves path coverage because it can observe the anchor, initial drop, BUY rebound, holding period, profit activation, and SELL trail in one continuous RTH period. It can therefore screen all ATR multipliers and ATR windows jointly inside the standardized simulator.
 
-It still does not contain BouncyBot's actual settings, user start/stop decisions, account risk limits, order acknowledgements, partial fills, commissions, or real execution outcomes. It also contains only Level 1 state, not market depth or queue position. The independently recorded feed may differ slightly from the exact callback stream seen by BouncyBot.
+The recording itself does not contain BouncyBot's actual settings, user start/stop decisions, account risk limits, order acknowledgements, partial fills, commissions, or real execution outcomes. Optional v1.8 SQLite calibration can add actual ticker-specific execution quantity, commission, and quote-relative adverse-cost evidence, but it does not reconstruct historical app state or prove a hypothetical fill. Market Replay remains Level 1 evidence without market depth or queue position. The independently recorded feed may differ slightly from the exact callback stream seen by BouncyBot.
 
 A session is right-censored when the recording ends with a position open, an entry trail active, or enough standardized entry time remaining that another setup could still occur. Those sessions stay in every candidate's denominator and receive an explicit score penalty. More than 20% right-censored outcomes prevents a stable-evidence label.
 
@@ -119,3 +119,23 @@ Format 2 and format 3 both preserve `changed_fields`. Positive native trails are
 Several recordings improve independent-day coverage only when they represent the same instrument and non-overlapping complete dates. The optimizer does not combine partial periods into one synthetic day. A date appearing more than once is excluded in full, including when the fragments might appear complementary, because continuity of ATR, anchor, native trail, and position state cannot be established from separate files.
 
 Millions of events across five dates still provide roughly five independent day-level observations. Whole-day bootstrap, leave-one-day-out, stable regions, tail checks, and ATR phase stress are used to reject fragile changes; they cannot create new regimes or make an in-sample result out-of-sample. Any incomplete paired outcome blocks a changed recommendation in v1.6. Later unseen recordings and forward paper trading remain required.
+
+## Version 1.8 continuity and calibration limitations
+
+An open long or submitted SELL trail can cross an RTH boundary only when the adjacent periods are complete, primary-eligible, and conservatively consecutive. Friday-to-Monday is recognized. A missing weekday or exchange holiday is ambiguous without a complete exchange calendar; the optimizer therefore breaks continuity instead of assuming the market was closed. Premarket/after-hours movement and overnight executions are not present in RTH-only recordings. The next session begins from the prior close mark, and the first fresh in-session bid determines the observed opening gap for an existing long.
+
+A carried HOLD re-warms ATR before deriving an unsubmitted normal SELL. An already submitted native SELL trail remains locked. This distinction mirrors the strategy lifecycle but still assumes that no broker-side cancellation, corporate action, manual trade, split, dividend, currency movement, or account event altered the position between recordings.
+
+Whole-day bootstrap values use the observed incremental daily outcomes of the continuous replay. Those outcomes can be serially dependent when one position spans several dates. Resampling days does not recreate the underlying path and does not produce independent market regimes. Bootstrap and leave-one-day-out remain fail-safe rejection evidence, not future-performance confidence guarantees.
+
+Optional SQLite calibration is accepted only from a stopped BouncyBot folder. Exact positive conId evidence is preferred; legacy ticker-only evidence is used only when no exact cycle exists. Quote matches are no-future and age-bounded, but the `.ibrec` feed and BouncyBot execution feed are independent subscriptions and may not align event-for-event. The 75th-percentile adverse reserve is deliberately conservative and is applied symmetrically per side even when only one side supplies the strongest estimate. Commission values in an incompatible currency are excluded because no FX series is available.
+
+Calibration cannot model market depth, queue priority, hidden liquidity, routing, market impact, exact partial-fill ordering, or whether a counterfactual order would have reached the same venue at the same time. It can raise the assumed cost reserve and replace the assumed quantity scale; it cannot turn the replay into an execution simulator.
+
+## Version 1.9 validation limits
+
+Walk-forward, moving-block, and selection-aware bootstrap reuse the selected historical recording set. Walk-forward creates chronologically unseen validation blocks inside that set, but it is not a substitute for later recordings collected after the recommendation was frozen. Selection-aware bootstrap estimates the stability of the search procedure and its out-of-bag result; it does not create new market regimes.
+
+A changed profile normally requires at least 20 primary-quality sessions because the default expanding walk-forward policy uses 15 training sessions and a five-session validation block. Exact leave-one-day-out and the fixed-profile bootstrap remain available from five primary days, but they are not sufficient by themselves to authorize a v1.9 change.
+
+Cross-fitted SQLite calibration prevents same-day and future execution evidence from calibrating an earlier replay date. Small per-side samples are shrunk toward the configured default, so reported p75/p90 values can remain assumption-sensitive. Market depth, routing, queue position, and counterfactual partial-fill ordering are still unobservable.

@@ -19,3 +19,11 @@ ATR-related values on each cycle row are treated as the settings snapshot for th
 ## Source safety
 
 The optimizer does not migrate, index, checkpoint, or write to the production database. It rejects a database or capture directory that resolves outside the selected source folder through a symlink. It copies the database and any WAL into a private temporary directory, opens only that copy, and creates a standalone SQLite snapshot. Temporary files are removed when analysis exits.
+
+## Optional Market Replay execution calibration
+
+Version 1.8 permits the independent `.ibrec` workflow to read a stopped BouncyBot portable-data folder solely for execution calibration. This is narrower than the normal SQLite-plus-captures analysis: `bot_state.sqlite` is required, while `debug_captures` is not.
+
+The calibration reader uses runtime schema discovery and tolerates absent optional columns. It prefers exact positive conId matches, then uses compatible ticker-only legacy cycles only when no exact-contract cycle exists. Executions are grouped by broker-order identity. Cycle-level commissions can provide side-level evidence when execution-row commissions are absent or less authoritative. Commission currencies incompatible with the instrument currency are excluded rather than converted implicitly.
+
+The production database is never opened by SQLite. The optimizer acquires the normal lock, copies the main database and supported sidecars through ordinary read-only file access, opens only a private snapshot, verifies the source state after reading, and releases the lock. No schema migration, checkpoint, index, setting write, or report write occurs in the BouncyBot folder.

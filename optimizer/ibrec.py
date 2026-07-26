@@ -26,6 +26,7 @@ from .market_replay_models import (
     IbrecTick,
     MarketReplayConfig,
 )
+from .utils import finite_float, finite_int
 
 
 class IbrecError(RuntimeError):
@@ -124,6 +125,27 @@ _REQUIRED_V3_COLUMNS = {
         "status",
     },
 }
+_CONNECTIVITY_ERROR_CODES = frozenset({1100, 1300, 2103})
+_CONNECTIVITY_RESTORE_CODES = frozenset({1101, 1102, 2104, 2106, 2158})
+_CONNECTIVITY_EVENT_NAMES = frozenset(
+    {
+        "IBKR_API_DISCONNECTED",
+        "IBKR_MARKET_DATA_FARM_DISCONNECTED",
+        "IBKR_UPSTREAM_DISCONNECTED",
+        "gateway_connection_failed",
+        "recording_callback_error",
+        "recording_failed",
+    }
+)
+_CONNECTIVITY_RESTORE_NAMES = frozenset(
+    {
+        "IBKR_MARKET_DATA_FARM_RESTORED",
+        "IBKR_UPSTREAM_RESTORED_DATA_LOST",
+        "IBKR_UPSTREAM_RESTORED_DATA_MAINTAINED",
+        "gateway_connected",
+        "market_data_reselected",
+    }
+)
 
 
 def _object_dict(value: object) -> dict[str, Any]:
@@ -132,6 +154,98 @@ def _object_dict(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {str(key): item for key, item in value.items()}
+
+
+def _quality_event(
+    *,
+    sequence: int,
+    created_at_utc: object,
+    event_type: object,
+    payload: object,
+) -> dict[str, Any] | None:
+    """Return a normalized connectivity-quality event when relevant."""
+
+    name = str(event_type or "").strip()
+    details = _object_dict(payload)
+    # Format-v2 exports normally flatten event fields, while other producers
+    # can retain a nested ``payload`` mapping. Accept both representations so a
+    # connectivity loss cannot be missed merely because of container layout.
+    nested = _object_dict(details.get("payload"))
+    if nested:
+        details = {**details, **nested}
+    error_code = finite_int(details.get("error_code"))
+    upper_name = name.upper()
+    is_disconnect = (
+        name in _CONNECTIVITY_EVENT_NAMES
+        or upper_name in _CONNECTIVITY_EVENT_NAMES
+        or error_code in _CONNECTIVITY_ERROR_CODES
+        or "DISCONNECT" in upper_name
+        or "CONNECTION_FAILED" in upper_name
+    )
+    is_restore = (
+        name in _CONNECTIVITY_RESTORE_NAMES
+        or upper_name in _CONNECTIVITY_RESTORE_NAMES
+        or error_code in _CONNECTIVITY_RESTORE_CODES
+        or "RESTORED" in upper_name
+        or upper_name == "GATEWAY_CONNECTED"
+    )
+    if not is_disconnect and not is_restore:
+        return None
+    normalized_time, timestamp = _parse_utc(
+        created_at_utc,
+        field=f"event {sequence} created_at_utc",
+    )
+    return {
+        "sequence": int(sequence),
+        "created_at_utc": normalized_time,
+        "timestamp": timestamp,
+        "event_type": name,
+        "error_code": error_code,
+        "message": str(details.get("message") or details.get("error") or ""),
+        "disconnect": bool(is_disconnect),
+        "restore": bool(is_restore),
+    }
+
+
+def _read_v2_quality_events(
+    archive: zipfile.ZipFile,
+    names: set[str],
+) -> list[dict[str, Any]]:
+    if "events.jsonl" not in names:
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        with archive.open("events.jsonl", "r") as raw:
+            text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+            for sequence, line in enumerate(text, start=1):
+                if len(line) > _MAX_CSV_PHYSICAL_LINE_CHARS:
+                    raise IbrecError(
+                        f"events.jsonl line {sequence} exceeds the "
+                        f"{_MAX_CSV_PHYSICAL_LINE_CHARS:,}-character safety limit."
+                    )
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise IbrecError(
+                        f"events.jsonl line {sequence} is invalid JSON: {exc}"
+                    ) from exc
+                if not isinstance(value, dict):
+                    raise IbrecError(
+                        f"events.jsonl line {sequence} must contain a JSON object."
+                    )
+                event = _quality_event(
+                    sequence=sequence,
+                    created_at_utc=value.get("created_at_utc"),
+                    event_type=value.get("event_type"),
+                    payload=value,
+                )
+                if event is not None:
+                    events.append(event)
+    except UnicodeDecodeError as exc:
+        raise IbrecError(f"events.jsonl is not valid UTF-8: {exc}") from exc
+    return events
 
 
 def _emit(progress: ProgressCallback | None, message: str, current: int, total: int) -> None:
@@ -245,15 +359,10 @@ def _parse_utc(value: Any, *, field: str) -> tuple[str, float]:
 
 
 def _nonnegative_int(value: Any, *, field: str) -> int:
-    if isinstance(value, bool):
+    number = finite_int(value)
+    if number is None or number < 0:
         raise IbrecError(f"{field} must be a non-negative integer.")
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise IbrecError(f"{field} must be a non-negative integer.") from exc
-    if not math.isfinite(number) or not number.is_integer() or number < 0:
-        raise IbrecError(f"{field} must be a non-negative integer.")
-    return int(number)
+    return number
 
 
 def _optional_nonnegative_float(value: Any, *, field: str) -> float | None:
@@ -267,6 +376,15 @@ def _optional_nonnegative_float(value: Any, *, field: str) -> float | None:
         raise IbrecError(f"{field} must be a finite non-negative number.") from exc
     if not math.isfinite(number) or number < 0:
         raise IbrecError(f"{field} must be a finite non-negative number.")
+    return number
+
+
+def _positive_finite_float(value: Any, *, field: str) -> float:
+    """Parse a required positive finite number without bool coercion."""
+
+    number = finite_float(value)
+    if number is None or number <= 0:
+        raise IbrecError(f"{field} must be a finite positive number.")
     return number
 
 
@@ -422,6 +540,10 @@ def _validate_manifest(raw: dict[str, Any], *, container: str) -> tuple[dict[str
         contract.get("con_id", contract.get("conId", 0)),
         field="manifest contract con_id",
     )
+    contract["min_tick"] = _positive_finite_float(
+        contract.get("min_tick", contract.get("minTick")),
+        field="manifest contract min_tick",
+    )
     row_count = _nonnegative_int(manifest.get("row_count", 0), field="manifest row_count")
     manifest["row_count"] = row_count
     if version == 3:
@@ -508,7 +630,18 @@ def _verify_v2_checksums(archive: zipfile.ZipFile, names: set[str], issues: list
             raise IbrecError(f"Checksum mismatch for {name!r}.")
 
 
-def _load_v2(path: Path, config: MarketReplayConfig, progress: ProgressCallback | None) -> tuple[dict[str, Any], dict[str, Any], list[IbrecTick], list[IbrecPeriod], list[str]]:
+def _load_v2(
+    path: Path,
+    config: MarketReplayConfig,
+    progress: ProgressCallback | None,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    list[IbrecTick],
+    list[IbrecPeriod],
+    list[str],
+    list[dict[str, Any]],
+]:
     issues: list[str] = []
     try:
         with zipfile.ZipFile(path, "r") as archive:
@@ -597,7 +730,8 @@ def _load_v2(path: Path, config: MarketReplayConfig, progress: ProgressCallback 
             if not ticks:
                 raise IbrecError("Recording contains no market-data rows.")
             periods = _derive_v2_periods(ticks, contract, issues)
-            return manifest, contract, ticks, periods, issues
+            quality_events = _read_v2_quality_events(archive, name_set)
+            return manifest, contract, ticks, periods, issues, quality_events
     except zipfile.BadZipFile as exc:
         raise IbrecError(f"Not a valid Market Replay v2 ZIP container: {exc}") from exc
     except UnicodeDecodeError as exc:
@@ -768,7 +902,7 @@ def _verify_v3_integrity(
     connection: sqlite3.Connection,
     manifest: dict[str, Any],
     raw_periods: dict[int, dict[str, Any]],
-) -> None:
+) -> list[dict[str, Any]]:
     quick_rows = connection.execute("PRAGMA quick_check").fetchall()
     quick = [tuple(row) for row in quick_rows]
     if quick != [("ok",)]:
@@ -808,6 +942,7 @@ def _verify_v3_integrity(
 
     event_chain = _ZERO_HASH
     event_count = 0
+    quality_events: list[dict[str, Any]] = []
     for event_count, row in enumerate(
         connection.execute("SELECT * FROM events ORDER BY sequence"),
         start=1,
@@ -836,6 +971,14 @@ def _verify_v3_integrity(
         event_chain = _chain_hash(event_chain, expected_hash)
         if str(row["chain_hash"]) != event_chain:
             raise IbrecError(f"Event chain hash mismatch at sequence {row['sequence']}.")
+        event = _quality_event(
+            sequence=int(row["sequence"]),
+            created_at_utc=row["created_at_utc"],
+            event_type=row["event_type"],
+            payload=payload,
+        )
+        if event is not None:
+            quality_events.append(event)
     if event_chain != str(source.get("event_chain_hash", _ZERO_HASH)):
         raise IbrecError("Final event integrity chain does not match the manifest.")
 
@@ -875,9 +1018,21 @@ def _verify_v3_integrity(
     )
     if tuple(latest) != expected_checkpoint:
         raise IbrecError("Latest checkpoint metadata is inconsistent with committed content.")
+    return quality_events
 
 
-def _load_v3(path: Path, config: MarketReplayConfig, progress: ProgressCallback | None) -> tuple[dict[str, Any], dict[str, Any], list[IbrecTick], list[IbrecPeriod], list[str]]:
+def _load_v3(
+    path: Path,
+    config: MarketReplayConfig,
+    progress: ProgressCallback | None,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    list[IbrecTick],
+    list[IbrecPeriod],
+    list[str],
+    list[dict[str, Any]],
+]:
     issues: list[str] = []
     try:
         with closing(_open_v3_copy(path)) as connection:
@@ -898,7 +1053,7 @@ def _load_v3(path: Path, config: MarketReplayConfig, progress: ProgressCallback 
                 int(manifest.get("rth_period_count", 0)),
                 issues,
             )
-            _verify_v3_integrity(connection, manifest, raw_periods)
+            quality_events = _verify_v3_integrity(connection, manifest, raw_periods)
             if row_count == 0:
                 raise IbrecError("Recording contains no market-data rows.")
             connection.row_factory = sqlite3.Row
@@ -943,7 +1098,7 @@ def _load_v3(path: Path, config: MarketReplayConfig, progress: ProgressCallback 
                 issues.append(
                     f"Recording status is {status or 'unknown'}; the final session can be incomplete and right-censored."
                 )
-            return manifest, contract, ticks, periods, issues
+            return manifest, contract, ticks, periods, issues, quality_events
     except sqlite3.DatabaseError as exc:
         raise IbrecError(f"Not a valid Market Replay v3 SQLite container: {exc}") from exc
 
@@ -1126,10 +1281,24 @@ def load_ibrec(
             header = stream.read(16)
         if header == _SQLITE_MAGIC:
             container = "sqlite"
-            manifest, contract, ticks, periods, issues = _load_v3(copied, normalized, progress)
+            (
+                manifest,
+                contract,
+                ticks,
+                periods,
+                issues,
+                quality_events,
+            ) = _load_v3(copied, normalized, progress)
         elif zipfile.is_zipfile(copied):
             container = "zip"
-            manifest, contract, ticks, periods, issues = _load_v2(copied, normalized, progress)
+            (
+                manifest,
+                contract,
+                ticks,
+                periods,
+                issues,
+                quality_events,
+            ) = _load_v2(copied, normalized, progress)
         else:
             raise IbrecError("Input is neither a Market Replay v2 ZIP nor a v3 SQLite .ibrec container.")
         # Re-hash the original components after the complete parse. This catches
@@ -1200,6 +1369,7 @@ def load_ibrec(
             retained_row_count=len(ticks),
             data_start_utc=ticks[0].captured_at_utc,
             data_end_utc=ticks[-1].captured_at_utc,
+            quality_events=quality_events,
         )
         if recording.is_synthetic:
             recording.issues.append(
@@ -1310,8 +1480,9 @@ def inspect_ibrec(config: MarketReplayConfig) -> dict[str, Any]:
             "time_zone_id",
             "timeZoneId",
         ),
-        "min_tick": float(
-            contract.get("min_tick", contract.get("minTick", 0.01)) or 0.01
+        "min_tick": _positive_finite_float(
+            contract.get("min_tick", contract.get("minTick")),
+            field="manifest contract min_tick",
         ),
         "exchange": _contract_text(contract, "exchange").upper(),
         "primary_exchange": _contract_text(
@@ -1341,10 +1512,7 @@ def _contract_text(contract: dict[str, Any], *keys: str, default: str = "") -> s
 def _recording_identity(recording: IbrecRecording) -> dict[str, Any]:
     contract = recording.contract
     raw_min_tick = contract.get("min_tick", contract.get("minTick"))
-    try:
-        min_tick = float(raw_min_tick)
-    except (TypeError, ValueError, OverflowError):
-        min_tick = math.nan
+    min_tick = finite_float(raw_min_tick)
     return {
         "symbol": recording.symbol,
         "con_id": recording.con_id,
@@ -1360,7 +1528,7 @@ def _recording_identity(recording: IbrecRecording) -> dict[str, Any]:
             "time_zone_id",
             "timeZoneId",
         ),
-        "min_tick": min_tick,
+        "min_tick": min_tick if min_tick is not None else math.nan,
     }
 
 
@@ -1368,10 +1536,7 @@ def _missing_identity_fields(identity: dict[str, Any]) -> list[str]:
     missing: list[str] = []
     if not str(identity.get("symbol") or "").strip() or identity.get("symbol") == "UNKNOWN":
         missing.append("symbol")
-    try:
-        con_id = int(identity.get("con_id") or 0)
-    except (TypeError, ValueError, OverflowError):
-        con_id = 0
+    con_id = finite_int(identity.get("con_id")) or 0
     if con_id <= 0:
         missing.append("positive conId")
     for field, label in (
@@ -1381,11 +1546,8 @@ def _missing_identity_fields(identity: dict[str, Any]) -> list[str]:
     ):
         if not str(identity.get(field) or "").strip():
             missing.append(label)
-    try:
-        min_tick = float(identity.get("min_tick"))
-    except (TypeError, ValueError, OverflowError):
-        min_tick = math.nan
-    if not math.isfinite(min_tick) or min_tick <= 0:
+    min_tick = finite_float(identity.get("min_tick"))
+    if min_tick is None or min_tick <= 0:
         missing.append("positive minimum tick")
     return missing
 
@@ -1469,11 +1631,17 @@ def combine_ibrec_recordings(
                 mismatches.append(
                     f"{key}: {identity[key]!r} versus {base_identity[key]!r}"
                 )
-        if not math.isclose(
-            float(identity["min_tick"]),
-            float(base_identity["min_tick"]),
-            rel_tol=0.0,
-            abs_tol=1e-12,
+        identity_min_tick = finite_float(identity.get("min_tick"))
+        base_min_tick = finite_float(base_identity.get("min_tick"))
+        if (
+            identity_min_tick is None
+            or base_min_tick is None
+            or not math.isclose(
+                identity_min_tick,
+                base_min_tick,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
         ):
             mismatches.append(
                 f"min_tick: {identity['min_tick']!r} versus {base_identity['min_tick']!r}"
@@ -1608,6 +1776,7 @@ def combine_ibrec_recordings(
                     "recording_content_sha256": recording_fingerprint,
                     "format_version": recording.format_version,
                     "container_format": recording.container_format,
+                    "manifest_status": str(recording.manifest.get("status") or ""),
                     "data_start_utc": (
                         recording.data_start_utc if role == "recording" else ""
                     ),
@@ -1657,6 +1826,23 @@ def combine_ibrec_recordings(
     }
     first_tick = min(combined_ticks, key=lambda tick: tick.timestamp)
     last_tick = max(combined_ticks, key=lambda tick: tick.timestamp)
+    combined_quality_events: list[dict[str, Any]] = []
+    for recording in ordered:
+        recording_fingerprint = _component_fingerprint(recording.input_components)
+        for event in recording.quality_events:
+            combined_quality_events.append(
+                {
+                    **event,
+                    "source_recording_sha256": recording_fingerprint,
+                }
+            )
+    combined_quality_events.sort(
+        key=lambda item: (
+            float(item.get("timestamp") or 0.0),
+            str(item.get("source_recording_sha256") or ""),
+            int(item.get("sequence") or 0),
+        )
+    )
     return IbrecRecording(
         path=Path("selected_recordings.ibrec"),
         sha256=combined_hash,
@@ -1675,6 +1861,7 @@ def combine_ibrec_recordings(
         data_start_utc=first_tick.captured_at_utc,
         data_end_utc=last_tick.captured_at_utc,
         excluded_sessions=excluded_sessions,
+        quality_events=combined_quality_events,
     )
 
 
@@ -1707,6 +1894,38 @@ def load_ibrec_set(
             max_recordings=1,
             min_atr_pct=normalized.min_atr_pct,
             max_atr_pct=normalized.max_atr_pct,
+            assumed_trade_notional=normalized.assumed_trade_notional,
+            execution_cost_bps_per_side=normalized.execution_cost_bps_per_side,
+            buy_execution_cost_bps_per_side=(
+                normalized.buy_execution_cost_bps_per_side
+            ),
+            sell_execution_cost_bps_per_side=(
+                normalized.sell_execution_cost_bps_per_side
+            ),
+            execution_cost_overrides=normalized.execution_cost_overrides,
+            trade_notional_overrides=normalized.trade_notional_overrides,
+            turnover_penalty_bps_per_completed_trade=(
+                normalized.turnover_penalty_bps_per_completed_trade
+            ),
+            execution_quote_max_age_seconds=(
+                normalized.execution_quote_max_age_seconds
+            ),
+            entry_open_delay_seconds=normalized.entry_open_delay_seconds,
+            entry_cutoff_seconds=normalized.entry_cutoff_seconds,
+            buy_trail_cancel_seconds=normalized.buy_trail_cancel_seconds,
+            session_boundary_tolerance_seconds=(
+                normalized.session_boundary_tolerance_seconds
+            ),
+            max_market_event_gap_seconds=normalized.max_market_event_gap_seconds,
+            min_last_event_minute_coverage_pct=(
+                normalized.min_last_event_minute_coverage_pct
+            ),
+            max_last_event_gap_p95_seconds=(
+                normalized.max_last_event_gap_p95_seconds
+            ),
+            min_touch_liquidity_coverage_pct=(
+                normalized.min_touch_liquidity_coverage_pct
+            ),
         )
         recording = load_ibrec(single, progress=progress)
         cumulative_rows += recording.raw_row_count
@@ -1750,7 +1969,7 @@ def inspect_ibrec_set(config: MarketReplayConfig) -> dict[str, Any]:
     ]
     hashes: set[str] = set()
     symbol = str(details[0]["symbol"]).upper()
-    con_id = int(details[0]["con_id"])
+    con_id = finite_int(details[0].get("con_id")) or 0
     if not symbol or symbol == "UNKNOWN" or con_id <= 0:
         raise IbrecError(
             "Market Replay analysis requires an explicit symbol and positive conId."
@@ -1765,11 +1984,8 @@ def inspect_ibrec_set(config: MarketReplayConfig) -> dict[str, Any]:
             )
             if not str(details[0].get(key) or "").strip()
         ]
-        try:
-            min_tick = float(details[0].get("min_tick"))
-        except (TypeError, ValueError, OverflowError):
-            min_tick = math.nan
-        if not math.isfinite(min_tick) or min_tick <= 0:
+        min_tick = finite_float(details[0].get("min_tick"))
+        if min_tick is None or min_tick <= 0:
             missing.append("positive minimum tick")
         if missing:
             raise IbrecError(
@@ -1790,20 +2006,25 @@ def inspect_ibrec_set(config: MarketReplayConfig) -> dict[str, Any]:
         if digest in hashes:
             raise IbrecError("The same Market Replay recording content was selected more than once.")
         hashes.add(digest)
-        mismatches = [
-            key
-            for key in identity_keys
+        mismatches: list[str] = []
+        for key in identity_keys:
+            if key != "min_tick":
+                if detail[key] != expected[key]:
+                    mismatches.append(key)
+                continue
+            detail_min_tick = finite_float(detail.get(key))
+            expected_min_tick = finite_float(expected.get(key))
             if (
-                not math.isclose(
-                    float(detail[key]),
-                    float(expected[key]),
+                detail_min_tick is None
+                or expected_min_tick is None
+                or not math.isclose(
+                    detail_min_tick,
+                    expected_min_tick,
                     rel_tol=0.0,
                     abs_tol=1e-12,
                 )
-                if key == "min_tick"
-                else detail[key] != expected[key]
-            )
-        ]
+            ):
+                mismatches.append(key)
         if mismatches:
             raise IbrecError(
                 "Selected recordings do not share the same instrument identity: "

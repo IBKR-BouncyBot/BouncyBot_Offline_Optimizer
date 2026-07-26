@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from .utils import finite_int
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -13,15 +14,10 @@ ProgressCallback = Callable[[str, int, int], None]
 def _normalized_limit(value: Any, *, name: str, minimum: int) -> int:
     """Return a finite integer safety limit without bool/fraction truncation."""
 
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be an integer, not a boolean.")
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite integer.") from exc
-    if not math.isfinite(number) or not number.is_integer():
+    number = finite_int(value)
+    if number is None:
         raise ValueError(f"{name} must be a finite integer.")
-    return max(minimum, int(number))
+    return max(minimum, number)
 
 
 @dataclass(slots=True, frozen=True)
