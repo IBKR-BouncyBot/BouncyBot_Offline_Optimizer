@@ -1692,10 +1692,6 @@ def combine_ibrec_recordings(
         raise IbrecError(
             "No unambiguous trading date remained after excluding overlaps and same-day fragments."
         )
-    if excluded_sessions:
-        issues.append(
-            f"Excluded {len(excluded_sessions):,} trading date(s) because each date must be represented by exactly one RTH period."
-        )
 
     combined_periods: list[IbrecPeriod] = []
     combined_ticks: list[IbrecTick] = []
@@ -1747,6 +1743,16 @@ def combine_ibrec_recordings(
         next_period_id += 1
     if not combined_periods or not combined_ticks:
         raise IbrecError("No strategy-relevant RTH data remained after combining recordings.")
+    # The summary is emitted only after both exclusion sources have run: the
+    # overlap/fragment pass above and the no-retained-rows pass in the period
+    # loop.  Counting earlier understated the total or omitted the summary
+    # entirely when only late exclusions occurred.
+    if excluded_sessions:
+        issues.append(
+            f"Excluded {len(excluded_sessions):,} trading date(s): each date must be "
+            "represented by exactly one RTH period that retains at least one "
+            "strategy-relevant row."
+        )
 
     for index, recording in enumerate(ordered, start=1):
         recording_fingerprint = _component_fingerprint(recording.input_components)

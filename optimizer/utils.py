@@ -154,6 +154,32 @@ def mean(values: Iterable[float | None]) -> float | None:
     return sum(clean) / len(clean) if clean else None
 
 
+def canonical_session_date(value: object) -> str:
+    """Return one canonical ISO ``YYYY-MM-DD`` key for a session date.
+
+    Recording periods store session dates as ``YYYYMMDD`` while calibration
+    evidence uses ISO dates.  Every producer and consumer of a date-keyed
+    override must normalize through this one helper; otherwise the two formats
+    can silently fail to match, as they did before version 1.9.3.  A value in
+    an unrecognized format is returned stripped but unchanged so that a
+    malformed key can only ever fail to match, never accidentally collide.
+    """
+
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        try:
+            return datetime.strptime(text, "%Y%m%d").date().isoformat()
+        except ValueError:
+            # Keep malformed compact dates unchanged. They can then only fail
+            # to match valid recording dates; they are never transformed into
+            # a deceptively ISO-shaped but invalid key.
+            return text
+    try:
+        return datetime.fromisoformat(text).date().isoformat()
+    except ValueError:
+        return text
+
+
 def safe_name(value: str, fallback: str = "unknown") -> str:
     text = "".join(character if character.isalnum() or character in "-_." else "_" for character in str(value))
     text = text.strip("._")
@@ -174,14 +200,23 @@ def relative_or_absolute(path: Path, root: Path) -> str:
         return str(Path(path).resolve())
 
 
+_MAX_TICKER_FOLDER_CHARS = 100
+_TICKER_FOLDER_HASH_CHARS = 10
+
+
 def ticker_folder_name(ticker: str) -> str:
     """Return a stable, Windows-safe, collision-resistant report folder name."""
     import hashlib
 
     original = str(ticker).strip().upper()
     sanitized = safe_name(original, fallback="UNKNOWN")
-    if sanitized == original and len(original) <= 100:
+    if sanitized == original and len(original) <= _MAX_TICKER_FOLDER_CHARS:
         return sanitized
-    suffix = hashlib.sha256(original.encode("utf-8")).hexdigest()[:10]
-    stem = sanitized[: max(1, 89)]
+    suffix = hashlib.sha256(original.encode("utf-8")).hexdigest()[
+        :_TICKER_FOLDER_HASH_CHARS
+    ]
+    # One character is reserved for the "-" separator, keeping the full name
+    # within the 100-character cap: stem + "-" + hash suffix.
+    stem_budget = _MAX_TICKER_FOLDER_CHARS - _TICKER_FOLDER_HASH_CHARS - 1
+    stem = sanitized[: max(1, stem_budget)]
     return f"{stem}-{suffix}"

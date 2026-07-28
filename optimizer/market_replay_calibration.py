@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .database import DatabaseDataset, SnapshotDatabase, safe_float, safe_int
 from .market_replay_models import IbrecRecording, MarketReplayConfig
@@ -27,7 +28,7 @@ from .safety import (
     source_state,
     validate_database_source,
 )
-from .utils import percentile, timestamp_seconds
+from .utils import canonical_session_date, percentile, timestamp_seconds
 
 
 @dataclass(slots=True, frozen=True)
@@ -187,6 +188,45 @@ def _recording_currency(recording: IbrecRecording) -> str:
     return str(recording.contract.get("currency") or "").strip().upper()
 
 
+def _execution_session_date(
+    recording: IbrecRecording,
+    executed_at: float,
+) -> str:
+    """Return the exchange-session date associated with one execution.
+
+    BouncyBot execution timestamps are stored in UTC, while Market Replay RTH
+    periods are keyed by the exchange-local session date.  Using the UTC
+    calendar date directly can therefore leak same-session evidence into the
+    prior-only calibration set for exchanges whose session crosses midnight
+    UTC.  Prefer an unambiguous recorded RTH interval and otherwise fall back
+    to the contract's exchange time zone.
+    """
+
+    matching_dates = {
+        canonical_session_date(period.session_date)
+        for period in recording.periods
+        if period.open_timestamp <= executed_at <= period.close_timestamp
+        and canonical_session_date(period.session_date)
+    }
+    if len(matching_dates) == 1:
+        return next(iter(matching_dates))
+
+    time_zone_name = str(
+        recording.contract.get(
+            "time_zone_id",
+            recording.contract.get("timeZoneId", ""),
+        )
+        or ""
+    ).strip()
+    try:
+        local_zone = ZoneInfo(time_zone_name) if time_zone_name else timezone.utc
+    except (ZoneInfoNotFoundError, ValueError):
+        local_zone = timezone.utc
+    return datetime.fromtimestamp(executed_at, tz=timezone.utc).astimezone(
+        local_zone
+    ).date().isoformat()
+
+
 def _matching_cycle_ids(
     dataset: DatabaseDataset,
     recording: IbrecRecording,
@@ -334,6 +374,7 @@ def _derive_calibration(
     groups: dict[tuple[str, str, str], _OrderEvidence] = {}
     seen_rows: set[tuple[Any, ...]] = set()
     buy_notional_by_cycle: dict[str, float] = {}
+    buy_execution_dates_by_cycle: dict[str, set[str]] = {}
     usable = 0
     buy_rows = 0
     sell_rows = 0
@@ -360,14 +401,16 @@ def _derive_calibration(
         buy_rows += int(side == "BUY")
         sell_rows += int(side == "SELL")
         notional = quantity * price
+        execution_date = _execution_session_date(recording, executed_at)
         if side == "BUY" and cycle_id:
-            buy_notional_by_cycle[cycle_id] = buy_notional_by_cycle.get(cycle_id, 0.0) + notional
+            buy_notional_by_cycle[cycle_id] = (
+                buy_notional_by_cycle.get(cycle_id, 0.0) + notional
+            )
+            buy_execution_dates_by_cycle.setdefault(cycle_id, set()).add(
+                execution_date
+            )
 
         identity = _order_identity(row, cycle_id, side)
-        execution_date = datetime.fromtimestamp(
-            executed_at,
-            tz=timezone.utc,
-        ).date().isoformat()
         group = groups.setdefault(
             (cycle_id, side, identity),
             _OrderEvidence(
@@ -573,51 +616,60 @@ def _derive_calibration(
     effective_cost = max(effective_buy_cost, effective_sell_cost)
 
     effective_notional = normalized.assumed_trade_notional
-    used_notional = False
+    global_notional_changed = False
     if normalized.calibration_use_trade_notional:
         if len(buy_notional_by_cycle) >= normalized.calibration_min_samples and median_notional:
-            effective_notional = median_notional
-            used_notional = True
+            effective_notional = max(0.01, median_notional)
+            global_notional_changed = not math.isclose(
+                effective_notional,
+                normalized.assumed_trade_notional,
+                rel_tol=0.0,
+                abs_tol=0.005,
+            )
         else:
             warnings.append(
-                "Too few completed BUY-cycle notionals were available; the configured assumed notional was retained."
+                "Too few completed BUY-cycle notionals were available for one uniform replacement; the configured assumed notional was retained as the global fallback. Date-specific leave-date-out shrinkage may still apply when usable cycle evidence exists."
             )
 
-    def canonical_date(value: str) -> str:
-        text = str(value or "").strip()
-        if len(text) == 8 and text.isdigit():
-            return f"{text[:4]}-{text[4:6]}-{text[6:]}"
-        try:
-            return datetime.fromisoformat(text).date().isoformat()
-        except ValueError:
-            return text
-
+    # ``canonical_session_date`` is the one shared normalization used by both
+    # this producer and the replay simulator's override lookup.  Reintroducing
+    # a private date formatter here would recreate the pre-1.9.3 defect where
+    # ISO-keyed overrides never matched the recordings' YYYYMMDD periods.
     replay_dates = sorted(
         {
-            canonical_date(period.session_date)
+            canonical_session_date(period.session_date)
             for period in recording.periods
-            if canonical_date(period.session_date)
+            if canonical_session_date(period.session_date)
         }
     )
 
-    def cross_fitted_value(
+    def normalized_samples(
+        samples: list[tuple[str, float]],
+    ) -> list[tuple[str, float]]:
+        return [
+            (canonical_session_date(sample_date), value)
+            for sample_date, value in samples
+            if canonical_session_date(sample_date)
+            and math.isfinite(value)
+            and value >= 0
+        ]
+
+    def cross_fitted_cost(
         samples: list[tuple[str, float]],
         replay_date: str,
         default: float,
         probability: float,
     ) -> tuple[float, str, int]:
-        normalized_samples = [
-            (canonical_date(sample_date), value)
-            for sample_date, value in samples
-            if canonical_date(sample_date) and math.isfinite(value) and value >= 0
-        ]
-        prior = [value for sample_date, value in normalized_samples if sample_date < replay_date]
+        if not normalized.calibration_use_execution_cost:
+            return default, "disabled", 0
+        values = normalized_samples(samples)
+        prior = [value for sample_date, value in values if sample_date < replay_date]
         if len(prior) >= normalized.calibration_min_samples:
             estimate = percentile(prior, probability)
             return max(default, estimate or default), "prior_only", len(prior)
         leave_date_out = [
             value
-            for sample_date, value in normalized_samples
+            for sample_date, value in values
             if sample_date != replay_date
         ]
         if leave_date_out:
@@ -630,24 +682,64 @@ def _derive_calibration(
             return max(default, shrunk), "leave_date_out_shrunk", len(leave_date_out)
         return default, "configured_default", 0
 
-    buy_notional_samples: list[tuple[str, float]] = []
-    for group in buy_groups:
-        if group.execution_date and group.cycle_id in buy_notional_by_cycle:
-            buy_notional_samples.append(
-                (group.execution_date, buy_notional_by_cycle[group.cycle_id])
+    def cross_fitted_notional(
+        samples: list[tuple[str, float]],
+        replay_date: str,
+        default: float,
+    ) -> tuple[float, str, int]:
+        if not normalized.calibration_use_trade_notional:
+            return default, "disabled", 0
+        values = [
+            (sample_date, value)
+            for sample_date, value in normalized_samples(samples)
+            if value > 0
+        ]
+        prior = [value for sample_date, value in values if sample_date < replay_date]
+        if len(prior) >= normalized.calibration_min_samples:
+            estimate = percentile(prior, 0.50)
+            # The prior-only estimate honors the same 0.01 minimum as the
+            # global and shrunk paths.  A syntactically valid but pathological
+            # database can produce a positive median below half a cent, which
+            # would otherwise round to an invalid zero notional and abort the
+            # analysis during override normalization.
+            return max(0.01, estimate or default), "prior_only", len(prior)
+        leave_date_out = [
+            value
+            for sample_date, value in values
+            if sample_date != replay_date
+        ]
+        if leave_date_out:
+            estimate = percentile(leave_date_out, 0.50)
+            weight = min(
+                1.0,
+                len(leave_date_out) / normalized.calibration_min_samples,
             )
-    buy_notional_samples = sorted(set(buy_notional_samples))
+            shrunk = default + weight * ((estimate or default) - default)
+            return max(0.01, shrunk), "leave_date_out_shrunk", len(leave_date_out)
+        return default, "configured_default", 0
+
+    buy_notional_samples: list[tuple[str, float]] = []
+    ambiguous_notional_cycles = 0
+    for cycle_id, value in sorted(buy_notional_by_cycle.items()):
+        execution_dates = buy_execution_dates_by_cycle.get(cycle_id, set())
+        if len(execution_dates) == 1:
+            buy_notional_samples.append(
+                (next(iter(execution_dates)), value)
+            )
+        elif len(execution_dates) > 1:
+            ambiguous_notional_cycles += 1
+    buy_notional_samples.sort()
 
     date_specific_costs: list[dict[str, Any]] = []
     date_specific_notionals: list[dict[str, Any]] = []
     for replay_date in replay_dates:
-        buy_value, buy_mode, buy_count = cross_fitted_value(
+        buy_value, buy_mode, buy_count = cross_fitted_cost(
             buy_cost_by_date,
             replay_date,
             configured_cost,
             0.75,
         )
-        sell_value, sell_mode, sell_count = cross_fitted_value(
+        sell_value, sell_mode, sell_count = cross_fitted_cost(
             sell_cost_by_date,
             replay_date,
             configured_cost,
@@ -664,11 +756,10 @@ def _derive_calibration(
                 "sell_samples": sell_count,
             }
         )
-        notional_value, notional_mode, notional_count = cross_fitted_value(
+        notional_value, notional_mode, notional_count = cross_fitted_notional(
             buy_notional_samples,
             replay_date,
             normalized.assumed_trade_notional,
-            0.50,
         )
         date_specific_notionals.append(
             {
@@ -706,15 +797,31 @@ def _derive_calibration(
         warnings.append(
             f"Positive completed-cycle commission totals supplied commission evidence for {cycle_commission_groups_applied:,} broker-order group(s) whose row-level values were missing or less authoritative."
         )
+    if ambiguous_notional_cycles:
+        warnings.append(
+            f"{ambiguous_notional_cycles:,} completed BUY cycle(s) spanned more than one UTC date; those cycles were excluded from date-cross-fitted notional evidence."
+        )
 
-    used_cost = (
-        effective_buy_cost > normalized.execution_cost_bps_per_side + 1e-12
-        or effective_sell_cost > normalized.execution_cost_bps_per_side + 1e-12
+    used_cost = normalized.calibration_use_execution_cost and (
+        effective_buy_cost > configured_cost + 1e-12
+        or effective_sell_cost > configured_cost + 1e-12
         or any(
-            row["buy_cost_bps"] > normalized.execution_cost_bps_per_side + 1e-12
-            or row["sell_cost_bps"] > normalized.execution_cost_bps_per_side + 1e-12
+            row["buy_cost_bps"] > configured_cost + 1e-12
+            or row["sell_cost_bps"] > configured_cost + 1e-12
             for row in date_specific_costs
         )
+    )
+    date_notional_changed = any(
+        not math.isclose(
+            float(row["trade_notional"]),
+            normalized.assumed_trade_notional,
+            rel_tol=0.0,
+            abs_tol=0.005,
+        )
+        for row in date_specific_notionals
+    )
+    used_notional = normalized.calibration_use_trade_notional and (
+        global_notional_changed or date_notional_changed
     )
     return ExecutionCalibration(
         enabled=True,

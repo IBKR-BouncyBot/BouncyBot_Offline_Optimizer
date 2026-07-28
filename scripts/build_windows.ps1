@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$version = "1.9.2"
+$version = "1.9.3"
 $appName = "BouncyBotOfflineOptimizer"
 $runtimeDirectory = "BouncyBotOptimizerRuntime"
 $requiredPythonVersion = "3.11.9"

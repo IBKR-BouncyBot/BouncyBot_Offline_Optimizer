@@ -138,11 +138,30 @@ def _csv_value(value: Any) -> Any:
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
+    """Write rows with ``fields`` leading, plus every key seen in any row.
+
+    Several evidence tables legitimately mix row schemas: combine-time session
+    exclusions carry fewer keys than quality-gate exclusions, and gate-skipped
+    robustness rows carry fewer keys than evaluated ones.  Before version
+    1.9.3 the header came from the first row alone, silently dropping the
+    extra columns for the whole file.  The union below preserves the caller's
+    column order, appends additional keys in first-seen row order, and leaves
+    homogeneous files byte-identical.
+    """
+
+    ordered = list(dict.fromkeys(str(field) for field in fields))
+    seen = set(ordered)
+    for row in rows:
+        for key in row:
+            name = str(key)
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
+        writer = csv.DictWriter(stream, fieldnames=ordered, extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         for row in rows:
-            writer.writerow({field: _csv_value(row.get(field)) for field in fields})
+            writer.writerow({field: _csv_value(row.get(field)) for field in ordered})
 
 
 def _escape(value: Any) -> str:

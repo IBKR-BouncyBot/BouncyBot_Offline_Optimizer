@@ -1581,7 +1581,10 @@ def _setting_profiles(
             retained_settings=retained_settings,
             period=base_period,
             bar_seconds=base_bar,
-            drop=max(0.05, min(50.0, round(base_drop * factor, 2))),
+            # 0.01 is the trading app's GUI minimum for the initial-drop
+            # multiplier (see normalize_atr_multiplier); the sensitivity
+            # experiment must not use a stricter private floor.
+            drop=max(0.01, min(50.0, round(base_drop * factor, 2))),
             buy=base_buy,
             profit=base_profit,
             sell=base_sell,
@@ -2398,7 +2401,7 @@ def _analyze_ticker(
         for meta in sorted(
             ticker_metas,
             key=lambda item: (
-                item.cycle_number or -1,
+                -1 if item.cycle_number is None else item.cycle_number,
                 item.event_time_utc,
                 str(item.path),
             ),

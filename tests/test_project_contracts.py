@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_is_consistent_across_release_files() -> None:
-    assert APP_VERSION == "1.9.2"
+    assert APP_VERSION == "1.9.3"
     assert APP_NAME == "BouncyBot Offline Optimizer"
     for relative in [
         "pyproject.toml",
@@ -25,7 +25,7 @@ def test_version_is_consistent_across_release_files() -> None:
         "scripts/build_windows.ps1",
         "scripts/windows_version_info.txt",
         "docs/README.md",
-        "docs/V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md",
+        "docs/V1_9_3_CALIBRATION_DATE_KEY_AND_REPORT_INTEGRITY.md",
     ]:
         assert APP_VERSION in (ROOT / relative).read_text(encoding="utf-8-sig")
 
@@ -86,11 +86,14 @@ def test_version_is_consistent_across_release_files() -> None:
     assert "v1.9.1" in (
         ROOT / "docs/V1_9_1_RUFF_F841_QUALITY_GATE_CORRECTION.md"
     ).read_text(encoding="utf-8-sig")
+    assert "v1.9.2" in (
+        ROOT / "docs/V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md"
+    ).read_text(encoding="utf-8-sig")
     windows_version = (ROOT / "scripts/windows_version_info.txt").read_text(
         encoding="utf-8-sig"
     )
-    assert "filevers=(1, 9, 2, 0)" in windows_version
-    assert "prodvers=(1, 9, 2, 0)" in windows_version
+    assert "filevers=(1, 9, 3, 0)" in windows_version
+    assert "prodvers=(1, 9, 3, 0)" in windows_version
 
 
 def test_v191_reported_f841_condition_remains_corrected() -> None:
