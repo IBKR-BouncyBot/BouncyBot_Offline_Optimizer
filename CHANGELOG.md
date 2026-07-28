@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.9.3 — 2026-07-28
+
+Calibration date-key correction and report-integrity release.
+
+- Corrected the silent defect where date-cross-fitted BUY/SELL execution-cost and trade-notional calibration was never applied: recording periods use `YYYYMMDD` session dates while calibration emitted ISO `YYYY-MM-DD` override keys, so every per-date lookup missed and the uniform effective values were used instead. Producer and consumer now share one `canonical_session_date` helper, and override validation rejects canonically equivalent duplicate dates.
+- Corrected follow-on calibration defects exposed by the date-key repair: disabled cost/notional calibration toggles now suppress both global and per-date replacements; date-cross-fitted trade notionals may move below the configured default instead of being incorrectly floored like execution costs; one notional sample is retained per completed BUY cycle even when several cycles have identical dates and values; and ambiguous multi-date BUY cycles are excluded from date-specific notional evidence.
+- Execution timestamps are now assigned to the recorded exchange-session date, with contract-time-zone fallback, rather than to their UTC calendar date. This prevents same-session fills from leaking into prior-only calibration for exchanges whose RTH session crosses midnight UTC.
+- Canonical override dates are now stored in normalized configuration, so semantically identical `YYYYMMDD` and ISO inputs produce the same deterministic configuration and report identity. Empty non-string date keys fail closed.
+- Corrected Market Replay CSV exports that derived their header from the first row only: heterogeneous evidence rows (mixed combine-time and quality-gate session exclusions; gate-skipped versus evaluated robustness rows) silently lost columns for the whole file. Columns are now the union across all rows with the caller's order leading; homogeneous files remain byte-identical.
+- Emitted the combined-recording exclusion summary only after both exclusion passes (overlap/fragment dates and no-retained-rows periods) so the reported count can no longer be understated or omitted.
+- Loaded `kernel32` with `use_last_error=True` in the Windows process-liveness helper so the ACCESS_DENIED comparison reads a real saved error code instead of always zero.
+- Moved the Market Replay GUI preflight (recording copy and content-hash verification) onto a worker thread so multi-gigabyte selections no longer freeze the window; the fail-closed checks and the analysis worker's own re-verification are unchanged.
+- Hardened the asynchronous preflight against stale completion races: changing or clearing the recording set while hashing is in progress can no longer restore an obsolete Ready state, and unexpected worker exceptions are surfaced instead of leaving the interface stuck in Checking state.
+- Single-sourced all interpolated quantiles through `optimizer.utils.percentile`, aligned the initial-drop sensitivity floor with the trading app's 0.01 GUI minimum, treated stored cycle number 0 as known in the capture-inventory ordering, replaced a disguised folder-name length constant with named constants, removed a shadowing smoke-test import, and documented the validation-only `normalized()` call in refinement.
+- Added focused regression tests for calibration date-key application, canonical normalization, disabled-toggle behavior, cross-fitted notional direction and sample counting, stale preflight completion, unexpected preflight exceptions, and CSV column union.
+- Bumped the application version so content-addressed analysis IDs change with this release; identical inputs re-analyzed under 1.9.3 publish new report directories instead of colliding with pre-fix output.
+- Same-version release correction: validation now applies minimum/maximum bounds to the exact rounded notional and execution-cost values that are stored, and prior-only cross-fitted trade-notional estimates are clamped to the 0.01 currency-unit minimum. This prevents sub-cent notionals from rounding to zero and prevents near-10,000 bps values from rounding across the permitted execution-cost boundary.
+
 ## 1.9.2 — 2026-07-26
 
 Market Replay preflight presentation and Windows test clarification release.

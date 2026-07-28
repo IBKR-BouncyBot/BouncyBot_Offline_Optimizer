@@ -212,16 +212,54 @@ def test_windows_process_probe_uses_pointer_safe_ctypes_signatures(
         GetExitCodeProcess = FakeFunction(get_exit_code)
         CloseHandle = FakeFunction(lambda handle: closed.append(int(handle)) or True)
 
-    class FakeWindll:
-        kernel32 = FakeKernel32()
+    loader_calls: list[tuple[str, bool]] = []
 
-    monkeypatch.setattr(safety.ctypes, "windll", FakeWindll(), raising=False)
+    def fake_windll(name: str, *args, **kwargs):
+        loader_calls.append((name, bool(kwargs.get("use_last_error"))))
+        return FakeKernel32()
+
+    monkeypatch.setattr(safety.ctypes, "WinDLL", fake_windll, raising=False)
     monkeypatch.setattr(safety.ctypes, "get_last_error", lambda: 0, raising=False)
 
     assert _pid_is_running_windows(123)
     assert closed == [large_handle]
+    # ``use_last_error=True`` is what makes ``ctypes.get_last_error`` observe
+    # the saved error after each call; the plain ``windll`` loader never did.
+    assert loader_calls == [("kernel32", True)]
     assert FakeKernel32.OpenProcess.restype is wintypes.HANDLE
     assert FakeKernel32.GetExitCodeProcess.argtypes[0] is wintypes.HANDLE
+
+
+def test_windows_process_probe_reads_saved_last_error_for_denied_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import optimizer.safety as safety
+
+    class FakeFunction:
+        def __init__(self, implementation):
+            self.implementation = implementation
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):
+            return self.implementation(*args)
+
+    class FakeKernel32:
+        OpenProcess = FakeFunction(lambda access, inherit, pid: 0)
+        GetExitCodeProcess = FakeFunction(lambda handle, output: True)
+        CloseHandle = FakeFunction(lambda handle: True)
+
+    monkeypatch.setattr(
+        safety.ctypes, "WinDLL", lambda name, **kwargs: FakeKernel32(), raising=False
+    )
+
+    # ACCESS_DENIED(5) proves a live process the caller may not open: running.
+    monkeypatch.setattr(safety.ctypes, "get_last_error", lambda: 5, raising=False)
+    assert _pid_is_running_windows(123) is True
+
+    # Any other saved error (invalid parameter) means no such process.
+    monkeypatch.setattr(safety.ctypes, "get_last_error", lambda: 87, raising=False)
+    assert _pid_is_running_windows(123) is False
 
 
 def test_capture_state_rejects_archive_symlink_outside_source(tmp_path: Path) -> None:

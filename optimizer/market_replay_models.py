@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .utils import finite_float, finite_int
+from .utils import canonical_session_date, finite_float, finite_int
 
 
 def _positive_finite(value: float | None) -> float | None:
@@ -22,6 +23,21 @@ def _strict_positive_int(value: Any, *, name: str, minimum: int) -> int:
     if number is None or number < minimum:
         raise ValueError(f"{name} must be an integer of at least {minimum:,}.")
     return number
+
+
+def _override_session_date(value: Any, *, error: str) -> str:
+    """Return one validated canonical date for date-specific assumptions."""
+
+    if not isinstance(value, str):
+        raise ValueError(error)
+    canonical = canonical_session_date(value.strip())
+    try:
+        valid = datetime.fromisoformat(canonical).date().isoformat() == canonical
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(error)
+    return canonical
 
 
 def _strict_bool(value: Any, *, name: str) -> bool:
@@ -153,15 +169,28 @@ class MarketReplayConfig:
                 raise ValueError(f"{name} must be between 0 and 100.")
             return number
 
-        assumed_notional = finite_nonnegative(
-            self.assumed_trade_notional,
-            name="assumed_trade_notional",
+        # Bounds are enforced on the exact rounded values that ``normalized``
+        # stores.  A raw value can satisfy a bound and still round across it
+        # (0.004 rounds to a zero notional; 9,999.9999996 rounds to 10,000.0
+        # bps), which previously produced a normalized configuration that
+        # failed its own re-normalization.
+        assumed_notional = round(
+            finite_nonnegative(
+                self.assumed_trade_notional,
+                name="assumed_trade_notional",
+            ),
+            2,
         )
-        if assumed_notional <= 0:
-            raise ValueError("assumed_trade_notional must be greater than zero.")
-        execution_cost = finite_nonnegative(
-            self.execution_cost_bps_per_side,
-            name="execution_cost_bps_per_side",
+        if assumed_notional < 0.01:
+            raise ValueError(
+                "assumed_trade_notional must be at least 0.01 after rounding to cents."
+            )
+        execution_cost = round(
+            finite_nonnegative(
+                self.execution_cost_bps_per_side,
+                name="execution_cost_bps_per_side",
+            ),
+            4,
         )
         if execution_cost >= 10_000:
             raise ValueError(
@@ -170,17 +199,23 @@ class MarketReplayConfig:
         buy_execution_cost = (
             execution_cost
             if self.buy_execution_cost_bps_per_side is None
-            else finite_nonnegative(
-                self.buy_execution_cost_bps_per_side,
-                name="buy_execution_cost_bps_per_side",
+            else round(
+                finite_nonnegative(
+                    self.buy_execution_cost_bps_per_side,
+                    name="buy_execution_cost_bps_per_side",
+                ),
+                6,
             )
         )
         sell_execution_cost = (
             execution_cost
             if self.sell_execution_cost_bps_per_side is None
-            else finite_nonnegative(
-                self.sell_execution_cost_bps_per_side,
-                name="sell_execution_cost_bps_per_side",
+            else round(
+                finite_nonnegative(
+                    self.sell_execution_cost_bps_per_side,
+                    name="sell_execution_cost_bps_per_side",
+                ),
+                6,
             )
         )
         if buy_execution_cost >= 10_000 or sell_execution_cost >= 10_000:
@@ -191,11 +226,18 @@ class MarketReplayConfig:
         cost_overrides: list[tuple[str, float, float]] = []
         seen_cost_dates: set[str] = set()
         for raw_date, raw_buy, raw_sell in self.execution_cost_overrides:
+            error = (
+                "execution_cost_overrides require unique non-empty session dates "
+                "in a valid format."
+            )
             date_key = str(raw_date).strip()
-            if not date_key or date_key in seen_cost_dates:
-                raise ValueError(
-                    "execution_cost_overrides require unique non-empty session dates."
-                )
+            # Uniqueness is enforced on the canonical ISO form because the
+            # replay lookup canonicalizes keys: ``20260721`` and
+            # ``2026-07-21`` must be rejected as duplicates, not allowed to
+            # silently overwrite one another.
+            canonical_key = _override_session_date(raw_date, error=error)
+            if canonical_key in seen_cost_dates:
+                raise ValueError(error)
             buy_value = finite_nonnegative(
                 raw_buy,
                 name=f"execution_cost_overrides[{date_key}].buy",
@@ -204,25 +246,37 @@ class MarketReplayConfig:
                 raw_sell,
                 name=f"execution_cost_overrides[{date_key}].sell",
             )
-            if buy_value >= 10_000 or sell_value >= 10_000:
+            rounded_buy = round(buy_value, 6)
+            rounded_sell = round(sell_value, 6)
+            if rounded_buy >= 10_000 or rounded_sell >= 10_000:
                 raise ValueError("Date-specific execution reserves must be below 10,000 bps.")
-            seen_cost_dates.add(date_key)
-            cost_overrides.append((date_key, round(buy_value, 6), round(sell_value, 6)))
+            seen_cost_dates.add(canonical_key)
+            # Store the canonical key as well as comparing with it. Equivalent
+            # spellings must normalize to one identical configuration so report
+            # identity and bytes do not depend on whether a caller supplied
+            # YYYYMMDD or ISO YYYY-MM-DD.
+            cost_overrides.append((canonical_key, rounded_buy, rounded_sell))
 
         notional_overrides: list[tuple[str, float]] = []
         seen_notional_dates: set[str] = set()
         for raw_date, raw_value in self.trade_notional_overrides:
-            date_key = str(raw_date).strip()
-            value = finite_nonnegative(
-                raw_value,
-                name=f"trade_notional_overrides[{date_key}]",
+            error = (
+                "trade_notional_overrides require unique dates in a valid format "
+                "and notionals of at least 0.01."
             )
-            if not date_key or date_key in seen_notional_dates or value <= 0:
-                raise ValueError(
-                    "trade_notional_overrides require unique dates and positive notionals."
-                )
-            seen_notional_dates.add(date_key)
-            notional_overrides.append((date_key, round(value, 2)))
+            date_key = str(raw_date).strip()
+            canonical_key = _override_session_date(raw_date, error=error)
+            value = round(
+                finite_nonnegative(
+                    raw_value,
+                    name=f"trade_notional_overrides[{date_key}]",
+                ),
+                2,
+            )
+            if canonical_key in seen_notional_dates or value < 0.01:
+                raise ValueError(error)
+            seen_notional_dates.add(canonical_key)
+            notional_overrides.append((canonical_key, value))
         turnover_penalty = finite_nonnegative(
             self.turnover_penalty_bps_per_completed_trade,
             name="turnover_penalty_bps_per_completed_trade",

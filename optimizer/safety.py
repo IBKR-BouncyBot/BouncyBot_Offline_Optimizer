@@ -92,7 +92,12 @@ def _pid_is_running_windows(pid: int) -> bool:
     try:
         from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # ``use_last_error=True`` is required for ``ctypes.get_last_error`` to
+        # observe the thread-local error saved after each foreign call.  With
+        # the plain ``ctypes.windll`` loader the saved value never updates, so
+        # the ACCESS_DENIED comparison below always saw zero and a running but
+        # protected process was misreported as not running.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         get_last_error = getattr(ctypes, "get_last_error", lambda: 0)
     except Exception:
         return True

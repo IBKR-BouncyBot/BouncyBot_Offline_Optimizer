@@ -98,6 +98,45 @@ class MarketReplayWorker(QObject):
             self.finished.emit()
 
 
+class ReplayPreflightWorker(QObject):
+    """Run the structural .ibrec preflight off the interface thread.
+
+    ``inspect_ibrec_set`` copies every selected recording and verifies its
+    content hashes, which can take many seconds for multi-gigabyte inputs.
+    Before version 1.9.3 this ran synchronously in the check handler and
+    froze the window.  The exact fail-closed checks are unchanged, and the
+    analysis worker still re-copies and re-verifies everything itself.
+    """
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, config: MarketReplayConfig):
+        super().__init__()
+        self.config = config
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            details = inspect_ibrec_set(self.config)
+            if self.config.calibration_source_dir is not None:
+                validate_database_source(
+                    source_paths(self.config.calibration_source_dir)
+                )
+            self.succeeded.emit(details)
+        except (IbrecError, OSError, SourceSafetyError, ValueError) as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            # A background exception must never leave the interface stuck in
+            # its amber "Checking…" state. Unexpected failures remain
+            # fail-closed and include their type for diagnostics, matching the
+            # full analysis workers.
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+        finally:
+            self.finished.emit()
+
+
 _REPLAY_COLUMNS = (
     ("Ticker", "Contract symbol stored in the Market Replay recording."),
     ("Format", "Accepted .ibrec format version(s) and number of input files."),
@@ -128,6 +167,9 @@ class MainWindow(QMainWindow):
         self.resize(1120, 780)
         self._thread: QThread | None = None
         self._worker: QObject | None = None
+        self._preflight_thread: QThread | None = None
+        self._preflight_worker: ReplayPreflightWorker | None = None
+        self._preflight_pending = False
         self._active_mode: str | None = None
         self._last_result: AnalysisResult | None = None
         self._last_market_result: MarketReplayAnalysisResult | None = None
@@ -487,28 +529,61 @@ class MainWindow(QMainWindow):
         return True
 
     @Slot()
-    def _check_ibrec(self) -> bool:
+    def _check_ibrec(self) -> None:
         paths = self._selected_ibrec_paths()
         if not paths:
+            # When an older check is still running, remember that its result is
+            # stale. The completion handler will ignore it and re-evaluate the
+            # now-empty selection before enabling Analyze.
+            self._preflight_pending = self._preflight_thread is not None
             self.ibrec_preflight_label.setText("Select one or more .ibrec v2/v3 recordings")
             self.ibrec_preflight_label.setStyleSheet("color: #a00000;")
             self.ibrec_analyze_button.setEnabled(False)
-            return False
-        try:
-            config = self._market_replay_config(paths)
-            details = inspect_ibrec_set(config)
-            if config.calibration_source_dir is not None:
-                calibration_paths = source_paths(config.calibration_source_dir)
-                validate_database_source(calibration_paths)
-        except (IbrecError, OSError, SourceSafetyError, ValueError) as exc:
-            self.ibrec_preflight_label.setText(f"Blocked: {exc}")
-            self.ibrec_preflight_label.setStyleSheet("color: #a00000;")
-            self.ibrec_analyze_button.setEnabled(False)
-            return False
+            return
+        if self._preflight_thread is not None:
+            # A structural check is already hashing recordings on its worker
+            # thread.  Remember that the selection changed and run one fresh
+            # check when it finishes instead of stacking threads that would
+            # re-copy the same multi-gigabyte inputs.
+            self._preflight_pending = True
+            return
+        config = self._market_replay_config(paths)
+        self.ibrec_preflight_label.setText(
+            f"Checking {len(paths)} recording(s): copying and verifying content…"
+        )
+        self.ibrec_preflight_label.setStyleSheet("color: #9a5a00;")
+        self.ibrec_analyze_button.setEnabled(False)
+        self._start_preflight_worker(ReplayPreflightWorker(config))
+
+    def _start_preflight_worker(self, worker: ReplayPreflightWorker) -> None:
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)  # type: ignore[attr-defined]
+        worker.succeeded.connect(self._on_preflight_succeeded)  # type: ignore[attr-defined]
+        worker.failed.connect(self._on_preflight_failed)  # type: ignore[attr-defined]
+        worker.finished.connect(thread.quit)  # type: ignore[attr-defined]
+        worker.finished.connect(worker.deleteLater)  # type: ignore[attr-defined]
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._preflight_thread_finished)
+        self._preflight_thread = thread
+        self._preflight_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_preflight_succeeded(self, details: Any) -> None:
+        if self._preflight_pending:
+            # The recording set or calibration folder changed while this
+            # worker was hashing its immutable snapshot. Never publish or act
+            # on that stale result; one fresh check starts after thread cleanup.
+            return
+        worker = self._preflight_worker
+        calibration_selected = bool(
+            worker is not None and worker.config.calibration_source_dir is not None
+        )
         qualifiers = [f"{details['recording_count']} recording(s)"]
         if details.get("synthetic"):
             qualifiers.append("synthetic sample")
-        if config.calibration_source_dir is not None:
+        if calibration_selected:
             qualifiers.append("read-only SQLite calibration ready")
         format_label = market_replay_format_label(details)
         self.ibrec_preflight_label.setText(
@@ -519,7 +594,24 @@ class MainWindow(QMainWindow):
             "color: #9a5a00;" if details.get("synthetic") else "color: #176b36;"
         )
         self.ibrec_analyze_button.setEnabled(not self._busy)
-        return True
+
+    @Slot(str)
+    def _on_preflight_failed(self, message: str) -> None:
+        if self._preflight_pending:
+            return
+        self.ibrec_preflight_label.setText(f"Blocked: {message}")
+        self.ibrec_preflight_label.setStyleSheet("color: #a00000;")
+        self.ibrec_analyze_button.setEnabled(False)
+
+    @Slot()
+    def _preflight_thread_finished(self) -> None:
+        self._preflight_thread = None
+        self._preflight_worker = None
+        if self._preflight_pending:
+            # The selection changed while the previous check ran; the stale
+            # result was displayed briefly and is corrected by this rerun.
+            self._preflight_pending = False
+            self._check_ibrec()
 
     def _market_replay_config(
         self,
@@ -569,7 +661,14 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _start_ibrec_analysis(self) -> None:
-        if self._busy or not self._check_ibrec():
+        if self._busy or self._preflight_thread is not None:
+            return
+        if not self.ibrec_preflight_label.text().startswith("Ready:"):
+            # The button is normally disabled without a green preflight; this
+            # guard also refreshes the check if state drifted.  The analysis
+            # worker independently re-copies and re-verifies every recording,
+            # so preflight remains a courtesy, not the safety boundary.
+            self._check_ibrec()
             return
         # Preserve the final path component. MarketReplayConfig/load_ibrec must
         # be able to reject an input symlink instead of receiving its resolved
@@ -810,6 +909,14 @@ class MainWindow(QMainWindow):
                 self,
                 "Analysis is running",
                 "Wait for the analysis to finish so temporary files and any owned lock can be released cleanly.",
+            )
+            event.ignore()
+            return
+        if self._preflight_thread is not None and self._preflight_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Recording check is running",
+                "Wait for the recording structure check to finish so its temporary copies can be released cleanly.",
             )
             event.ignore()
             return

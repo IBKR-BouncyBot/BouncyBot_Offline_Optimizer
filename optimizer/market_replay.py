@@ -41,6 +41,7 @@ from .market_replay_validation import (
     score_policy_contract,
     score_sessions,
 )
+from .utils import canonical_session_date, percentile
 from .version import APP_VERSION
 
 
@@ -691,19 +692,27 @@ def _simulate_session_stateful(
         raise MarketReplayAnalysisError(
             "Normalized replay configuration did not provide side-specific execution reserves."
         )
+    # Recording periods store ``YYYYMMDD`` session dates while calibration
+    # emits ISO ``YYYY-MM-DD`` override keys.  Both sides of the lookup must
+    # normalize through the one shared helper; matching on the raw strings
+    # silently ignored every date-specific override before version 1.9.3.
+    session_date_key = canonical_session_date(period.session_date)
     cost_overrides = {
-        date_key: (buy_cost, sell_cost)
+        canonical_session_date(date_key): (buy_cost, sell_cost)
         for date_key, buy_cost, sell_cost in normalized.execution_cost_overrides
     }
     buy_cost_bps, sell_cost_bps = cost_overrides.get(
-        period.session_date,
+        session_date_key,
         (default_buy_cost, default_sell_cost),
     )
     buy_execution_cost_rate = buy_cost_bps / 10_000.0
     sell_execution_cost_rate = sell_cost_bps / 10_000.0
-    notional_overrides = dict(normalized.trade_notional_overrides)
+    notional_overrides = {
+        canonical_session_date(date_key): value
+        for date_key, value in normalized.trade_notional_overrides
+    }
     assumed_trade_notional = notional_overrides.get(
-        period.session_date,
+        session_date_key,
         normalized.assumed_trade_notional,
     )
     entry_start = period.open_timestamp + normalized.entry_open_delay_seconds
@@ -1825,6 +1834,9 @@ def _refined_profiles(
     seeds: list[MarketReplayCandidateSummary],
     config: MarketReplayConfig,
 ) -> list[AtrProfile]:
+    # Validation only: ``normalized()`` raises on an invalid configuration.
+    # Its return value is deliberately unused because refinement neighbours
+    # are derived from the seed profiles, not from the configured defaults.
     config.normalized()
     profiles: set[AtrProfile] = set()
     for seed in seeds:
@@ -1891,19 +1903,14 @@ def _refinement_seeds(
 
 
 def _quantile(values: Iterable[float], probability: float) -> float | None:
-    ordered = sorted(value for value in values if math.isfinite(value))
-    if not ordered:
-        return None
-    if len(ordered) == 1:
-        return ordered[0]
-    probability = max(0.0, min(1.0, float(probability)))
-    position = probability * (len(ordered) - 1)
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
-    if lower == upper:
-        return ordered[lower]
-    fraction = position - lower
-    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+    """Delegate to the one shared interpolated-percentile implementation.
+
+    Keeping a module-local name preserves existing call sites while ensuring
+    every quantile in the application is computed by exactly one function
+    (:func:`optimizer.utils.percentile`), so the copies can never drift.
+    """
+
+    return percentile(values, probability)
 
 
 def _deterministic_bootstrap_indices(

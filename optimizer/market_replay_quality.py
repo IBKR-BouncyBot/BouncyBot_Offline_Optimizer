@@ -13,7 +13,7 @@ from .market_replay_models import (
     IbrecTick,
     MarketReplayConfig,
 )
-from .utils import finite_float, finite_int, truthy
+from .utils import finite_float, finite_int, percentile, truthy
 
 
 @dataclass(slots=True, frozen=True)
@@ -44,18 +44,9 @@ class MarketReplaySessionQuality:
 
 
 def _quantile(values: list[float], probability: float) -> float | None:
-    ordered = sorted(value for value in values if math.isfinite(value))
-    if not ordered:
-        return None
-    if len(ordered) == 1:
-        return ordered[0]
-    position = max(0.0, min(1.0, probability)) * (len(ordered) - 1)
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
-    if lower == upper:
-        return ordered[lower]
-    fraction = position - lower
-    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+    """Delegate to the one shared interpolated-percentile implementation."""
+
+    return percentile(values, probability)
 
 
 def _manifest_status(recording: IbrecRecording, period: IbrecPeriod) -> str:

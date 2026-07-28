@@ -324,9 +324,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The Windows build invokes this hidden mode to prove that the frozen
         # executable, PySide6 runtime, and application modules can all load.
         try:
+            # ``write_market_replay_report`` is intentionally the module-level
+            # import: re-importing it here shadowed that name and proved
+            # nothing extra about the frozen build.
             from .gui import MainWindow
             from .ibrec import inspect_ibrec
-            from .market_replay_reports import write_market_replay_report
         except ImportError:
             return 5
         return 0 if MainWindow is not None and inspect_ibrec is not None and write_market_replay_report is not None else 5

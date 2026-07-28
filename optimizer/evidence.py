@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 from typing import Any, Iterable
 
 from .models import CandidateSummary, ReplayObservation
-from .utils import median, timestamp_seconds
+from .utils import median, percentile, timestamp_seconds
 
 _USABLE_ATR_SOURCES = {"capture_reconstructed", "bot_captured_fallback"}
 _BOOTSTRAP_REPLICATES = 2_000
@@ -43,19 +43,14 @@ def _finite(value: Any) -> float | None:
 
 
 def _quantile(values: Iterable[float], probability: float) -> float | None:
-    ordered = sorted(value for value in values if math.isfinite(value))
-    if not ordered:
-        return None
-    if len(ordered) == 1:
-        return ordered[0]
-    probability = max(0.0, min(1.0, float(probability)))
-    position = probability * (len(ordered) - 1)
-    lower = int(math.floor(position))
-    upper = int(math.ceil(position))
-    if lower == upper:
-        return ordered[lower]
-    fraction = position - lower
-    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+    """Delegate to the one shared interpolated-percentile implementation.
+
+    Keeping a module-local name preserves existing call sites while ensuring
+    every quantile in the application is computed by exactly one function
+    (:func:`optimizer.utils.percentile`), so the copies can never drift.
+    """
+
+    return percentile(values, probability)
 
 
 def _cycle_key(row: ReplayObservation) -> str:

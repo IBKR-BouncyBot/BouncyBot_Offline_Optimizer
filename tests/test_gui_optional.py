@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,9 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
+import optimizer.gui as gui_module
 from optimizer.analysis import run_analysis
-from optimizer.gui import MainWindow
+from optimizer.gui import MainWindow, ReplayPreflightWorker
 from optimizer.market_replay import run_market_replay_analysis
 from optimizer.market_replay_models import MarketReplayConfig
 from optimizer.market_replay_reports import write_market_replay_report
@@ -73,10 +75,17 @@ def test_market_replay_tab_preflights_v3_and_opens_its_separate_report(
     window = MainWindow(tmp_path, tmp_path / "bot-reports", recording)
     assert window.tabs.count() == 2
     assert window.tabs.tabText(1) == "Market Replay (.ibrec v2/v3)"
-    assert window._check_ibrec() is True
+    window._check_ibrec()
+    deadline = time.monotonic() + 30.0
+    while window._preflight_thread is not None:
+        assert time.monotonic() < deadline, "recording preflight did not finish"
+        app.processEvents()
+        time.sleep(0.01)
     preflight_text = window.ibrec_preflight_label.text()
+    assert preflight_text.startswith("Ready:")
     assert "v3 sqlite" in preflight_text.lower()
     assert "format(s) [3]" not in preflight_text
+    assert window.ibrec_analyze_button.isEnabled()
 
     opened: list[tuple[Path, str]] = []
     monkeypatch.setattr(
@@ -99,3 +108,62 @@ def test_market_replay_tab_preflights_v3_and_opens_its_separate_report(
 
     window.close()
     app.processEvents()
+
+
+def test_stale_preflight_result_is_ignored_after_recordings_are_cleared(
+    tmp_path: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path, tmp_path / "reports")
+    window.ibrec_list.addItem(str(tmp_path / "old.ibrec"))
+    # Simulate an already-running worker without starting a real hash pass.
+    window._preflight_thread = object()  # type: ignore[assignment]
+
+    window.ibrec_list.clear()
+    window._check_ibrec()
+    assert window._preflight_pending is True
+    assert not window.ibrec_preflight_label.text().startswith("Ready:")
+    assert not window.ibrec_analyze_button.isEnabled()
+
+    window._on_preflight_succeeded(
+        {
+            "recording_count": 1,
+            "symbol": "AAPL",
+            "row_count": 100,
+            "format_versions": [3],
+            "container_formats": ["sqlite"],
+        }
+    )
+    assert not window.ibrec_preflight_label.text().startswith("Ready:")
+    assert not window.ibrec_analyze_button.isEnabled()
+
+    window._preflight_thread_finished()
+    assert window._preflight_thread is None
+    assert window._preflight_pending is False
+    assert window.ibrec_preflight_label.text().startswith("Select one or more")
+    assert not window.ibrec_analyze_button.isEnabled()
+
+    window.close()
+    app.processEvents()
+
+
+def test_preflight_worker_reports_unexpected_exceptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_unexpectedly(_config: MarketReplayConfig):
+        raise RuntimeError("unexpected preflight failure")
+
+    monkeypatch.setattr(gui_module, "inspect_ibrec_set", fail_unexpectedly)
+    worker = ReplayPreflightWorker(
+        MarketReplayConfig(tmp_path / "probe.ibrec", tmp_path / "reports")
+    )
+    failures: list[str] = []
+    finished: list[bool] = []
+    worker.failed.connect(failures.append)
+    worker.finished.connect(lambda: finished.append(True))
+
+    worker.run()
+
+    assert failures == ["RuntimeError: unexpected preflight failure"]
+    assert finished == [True]

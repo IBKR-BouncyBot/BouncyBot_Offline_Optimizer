@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 9, 2, 0),
-    prodvers=(1, 9, 2, 0),
+    filevers=(1, 9, 3, 0),
+    prodvers=(1, 9, 3, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'BouncyBot'),
           StringStruct(u'FileDescription', u'BouncyBot Offline Optimizer'),
-          StringStruct(u'FileVersion', u'1.9.2'),
+          StringStruct(u'FileVersion', u'1.9.3'),
           StringStruct(u'InternalName', u'BouncyBotOfflineOptimizer'),
           StringStruct(u'OriginalFilename', u'BouncyBotOfflineOptimizer.exe'),
           StringStruct(u'ProductName', u'BouncyBot Offline Optimizer'),
-          StringStruct(u'ProductVersion', u'1.9.2')
+          StringStruct(u'ProductVersion', u'1.9.3')
         ]
       )
     ]),

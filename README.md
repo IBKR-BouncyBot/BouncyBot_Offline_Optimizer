@@ -1,4 +1,4 @@
-# BouncyBot Offline Optimizer v1.9.2
+# BouncyBot Offline Optimizer v1.9.3
 
 A portable, read-only companion application for **BouncyBot - IBKR Portable Trading Bot** with two independent workflows:
 
@@ -42,7 +42,7 @@ For format 3, the importer verifies SQLite structure, foreign keys, every tick/e
 
 Synthetic sample provenance, delayed-only sessions, mixed live/delayed sessions, frozen-feed interruptions, recorder clock reversals, inadequate RTH coverage, material connectivity gaps, sparse Last-event evidence, or an unfinalized source prevent a changed recommendation. Crossed two-sided quotes are retained as quality evidence but are not used as executable touches or stop-reference inputs.
 
-The Market Replay result remains a bounded paper-testing candidate, not a mathematical optimum or live-trading instruction. Version 1.9.0 adds exact leave-one-day-out reselection, chronological walk-forward validation, moving-block and selection-aware bootstrap, separate date-cross-fitted BUY/SELL calibration, score-policy and Pareto checks, outward search-boundary extension, deterministic assumption stress, and economic overnight-continuity evidence. See the [v1.9.2 Market Replay preflight and Windows test clarification](docs/V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md), the [v1.9.1 Ruff F841 quality-gate correction](docs/V1_9_1_RUFF_F841_QUALITY_GATE_CORRECTION.md), the [v1.9.0 robust selection and validation release note](docs/V1_9_0_ROBUST_SELECTION_VALIDATION.md), the [v1.8.2 Pyright and numeric-evidence hardening](docs/V1_8_2_PYRIGHT_AND_NUMERIC_EVIDENCE_HARDENING.md), and the [v1.8.0 continuous replay and execution-calibration release note](docs/V1_8_0_CONTINUOUS_REPLAY_AND_EXECUTION_CALIBRATION.md).
+The Market Replay result remains a bounded paper-testing candidate, not a mathematical optimum or live-trading instruction. Version 1.9.0 adds exact leave-one-day-out reselection, chronological walk-forward validation, moving-block and selection-aware bootstrap, separate date-cross-fitted BUY/SELL calibration, score-policy and Pareto checks, outward search-boundary extension, deterministic assumption stress, and economic overnight-continuity evidence. See the [v1.9.3 calibration date-key correction and report integrity](docs/V1_9_3_CALIBRATION_DATE_KEY_AND_REPORT_INTEGRITY.md), the [v1.9.2 Market Replay preflight and Windows test clarification](docs/V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md), the [v1.9.1 Ruff F841 quality-gate correction](docs/V1_9_1_RUFF_F841_QUALITY_GATE_CORRECTION.md), the [v1.9.0 robust selection and validation release note](docs/V1_9_0_ROBUST_SELECTION_VALIDATION.md), the [v1.8.2 Pyright and numeric-evidence hardening](docs/V1_8_2_PYRIGHT_AND_NUMERIC_EVIDENCE_HARDENING.md), and the [v1.8.0 continuous replay and execution-calibration release note](docs/V1_8_0_CONTINUOUS_REPLAY_AND_EXECUTION_CALIBRATION.md).
 
 ## What the replay can and cannot do
 
