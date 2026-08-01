@@ -38,6 +38,7 @@ class MarketReplaySessionQuality:
     frozen_feed: bool
     primary_eligible: bool
     exclusion_reasons: tuple[str, ...]
+    source_recording_sha256s: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -49,16 +50,47 @@ def _quantile(values: list[float], probability: float) -> float | None:
     return percentile(values, probability)
 
 
+def _period_source_hashes(period: IbrecPeriod) -> tuple[str, ...]:
+    """Return every content fingerprint that contributed to one period.
+
+    A merged period stitched from several same-date fragments carries one
+    fingerprint per contributing recording; single-source periods keep exactly
+    one.  Legacy constructors that only set the joined display string fall
+    back to that string so equality matching keeps working.
+    """
+
+    if period.source_recording_sha256s:
+        return period.source_recording_sha256s
+    if period.source_recording_sha256 and "+" not in period.source_recording_sha256:
+        return (period.source_recording_sha256,)
+    return tuple(
+        part
+        for part in period.source_recording_sha256.split("+")
+        if part
+    )
+
+
 def _manifest_status(recording: IbrecRecording, period: IbrecPeriod) -> str:
-    if period.source_recording_sha256:
-        for component in recording.input_components:
-            if str(component.get("role") or "") != "recording":
-                continue
-            if (
-                str(component.get("recording_content_sha256") or "")
-                == period.source_recording_sha256
-            ):
-                return str(component.get("manifest_status") or "").strip().lower()
+    source_hashes = _period_source_hashes(period)
+    if source_hashes:
+        statuses: list[str] = []
+        for source_hash in source_hashes:
+            for component in recording.input_components:
+                if str(component.get("role") or "") != "recording":
+                    continue
+                if (
+                    str(component.get("recording_content_sha256") or "")
+                    == source_hash
+                ):
+                    statuses.append(
+                        str(component.get("manifest_status") or "").strip().lower()
+                    )
+                    break
+        if statuses and len(statuses) == len(source_hashes):
+            unique = sorted(set(statuses))
+            # A merged period spanning sources with different finalization
+            # states must never inherit the most permissive one.
+            return unique[0] if len(unique) == 1 else "mixed"
     return str(recording.manifest.get("status") or "").strip().lower()
 
 
@@ -71,19 +103,29 @@ def _source_format_version(recording: IbrecRecording, period: IbrecPeriod) -> in
     instead of treating the combined container as one format.
     """
 
-    if period.source_recording_sha256:
-        for component in recording.input_components:
-            if str(component.get("role") or "") != "recording":
-                continue
-            if (
-                str(component.get("recording_content_sha256") or "")
-                != period.source_recording_sha256
-            ):
-                continue
-            version = finite_int(component.get("format_version"))
-            if version in {2, 3}:
-                return version
-            break
+    source_hashes = _period_source_hashes(period)
+    if source_hashes:
+        versions: set[int] = set()
+        resolved_sources = 0
+        for source_hash in source_hashes:
+            for component in recording.input_components:
+                if str(component.get("role") or "") != "recording":
+                    continue
+                if (
+                    str(component.get("recording_content_sha256") or "")
+                    != source_hash
+                ):
+                    continue
+                version = finite_int(component.get("format_version"))
+                if version in {2, 3}:
+                    versions.add(version)
+                    resolved_sources += 1
+                break
+        if resolved_sources == len(source_hashes) and len(versions) == 1:
+            return next(iter(versions))
+        # Missing or mixed-format component provenance must fail closed.  It is
+        # not sufficient to resolve only one member of a stitched period.
+        return 0
     return recording.format_version if recording.format_version in {2, 3} else 0
 
 
@@ -199,11 +241,8 @@ def _connectivity_events(
         if not truthy(event.get("disconnect")):
             continue
         source_hash = str(event.get("source_recording_sha256") or "")
-        if (
-            period.source_recording_sha256
-            and source_hash
-            and source_hash != period.source_recording_sha256
-        ):
+        period_hashes = _period_source_hashes(period)
+        if period_hashes and source_hash and source_hash not in period_hashes:
             continue
         timestamp = finite_float(event.get("timestamp"))
         if timestamp is None:
@@ -314,6 +353,7 @@ def assess_market_replay_session(
         frozen_feed=frozen_feed,
         primary_eligible=not reasons,
         exclusion_reasons=tuple(reasons),
+        source_recording_sha256s=_period_source_hashes(period),
     )
 
 

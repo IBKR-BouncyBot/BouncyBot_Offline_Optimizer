@@ -41,7 +41,7 @@ from .market_replay_validation import (
     score_policy_contract,
     score_sessions,
 )
-from .utils import canonical_session_date, percentile
+from .utils import canonical_session_date, percentile, timestamp_seconds
 from .version import APP_VERSION
 
 
@@ -51,7 +51,7 @@ class MarketReplayAnalysisError(RuntimeError):
 
 ProgressCallback = Callable[[str, int, int], None]
 AtrCacheKey = tuple[str, str, int, int, int]
-MARKET_REPLAY_ANALYSIS_CONTRACT_VERSION = 13
+MARKET_REPLAY_ANALYSIS_CONTRACT_VERSION = 15
 _CONTROL_PROFILE = AtrProfile(
     period=14,
     bar_seconds=60,
@@ -70,6 +70,11 @@ _COARSE_BUY = (0.00, 0.75, 1.25)
 _COARSE_PROFIT = (0.50, 1.00, 1.50)
 _COARSE_SELL = (0.00, 0.75, 1.25)
 _COARSE_MIN_ATR_PCT = (0.01, 0.05, 0.10, 0.20)
+_PROTECTIVE_MANUAL_TRAILS = (1.0, 2.0, 3.0, 4.0, 5.0)
+_PROTECTIVE_ATR_MULTIPLIERS = (1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5)
+_PROTECTIVE_MANUAL_STEP = 1.0
+_PROTECTIVE_ATR_STEP = 0.5
+_PROTECTIVE_MIN_REGION_SIZE = 3
 _WINDOW_SCREEN_MULTIPLIERS = (
     (1.50, 0.75, 1.00, 1.00),
     (1.00, 0.50, 0.75, 0.75),
@@ -103,6 +108,7 @@ _CLAMP_COMPONENTS = (
     "buy_rebound",
     "minimum_profit",
     "sell_trail",
+    "protective_sell",
 )
 _CLAMP_STATES = ("min", "max", "raw", "zero")
 
@@ -128,6 +134,13 @@ class _ReplayCarryState:
     sell_running_high: float | None = None
     sell_placed_sequence: int = 0
     sell_fill_reference: float | None = None
+    protective_sell_pct: float | None = None
+    protective_stop: float | None = None
+    protective_initial_stop: float | None = None
+    protective_running_high: float | None = None
+    protective_placed_sequence: int = 0
+    protective_fill_reference: float | None = None
+    protective_normal_activation_price: float | None = None
     capital: float = 1.0
     cycle_number: int = 1
     last_long_mark: float | None = None
@@ -142,6 +155,7 @@ class _ReplayCarryState:
             "HOLD",
             "SELL_TRAIL",
             "SELL_FILL_PENDING",
+            "PROTECTIVE_FILL_PENDING",
         }
 
 
@@ -157,6 +171,8 @@ class _BoundedSelectionRun:
     sessions_by_profile: dict[str, list[MarketReplaySessionResult]]
     atr_cache: dict[AtrCacheKey, list[float | None]]
     window_search: list[dict[str, Any]]
+    protective_policy_evidence: list[dict[str, Any]]
+    protective_policy_reason: str
 
 
 def _expected_next_weekday(value: date) -> date:
@@ -212,6 +228,25 @@ def market_replay_search_contract(config: MarketReplayConfig) -> dict[str, Any]:
         "contract_version": MARKET_REPLAY_ANALYSIS_CONTRACT_VERSION,
         "optimizer_version": APP_VERSION,
         "supported_ibrec_versions": [2, 3],
+        "protective_sell_policy_search": {
+            "enabled": normalized.protective_policy_search_enabled,
+            "purpose": (
+                "compare no protective order with bounded manual and ATR-adaptive native trailing SELL policies "
+                "at the unchanged ATR control before conditional ATR optimization"
+            ),
+            "disabled_control": True,
+            "manual_trailing_percentages": list(_PROTECTIVE_MANUAL_TRAILS),
+            "atr_adaptive_multipliers": list(_PROTECTIVE_ATR_MULTIPLIERS),
+            "minimum_adjacent_region_size": _PROTECTIVE_MIN_REGION_SIZE,
+            "maximum_policies_advanced": 2,
+            "advanced_policies": (
+                "the disabled control and at most one independently supported protective-policy region center"
+            ),
+            "normal_sell_replacement": (
+                "a working protective trail is cancelled before the normal minimum-profit SELL is submitted; "
+                "the Market Replay path models this cancel/replace atomically because .ibrec contains market data, not broker acknowledgements"
+            ),
+        },
         "atr_window_search": {
             "stage_1": {
                 "purpose": "compare bar duration with a small representative multiplier mini-grid while holding ATR period fixed",
@@ -272,6 +307,7 @@ def market_replay_search_contract(config: MarketReplayConfig) -> dict[str, Any]:
             _MIN_LOO_WINDOW_SELECTION_PCT
         ),
         "changed_recommendation_requires": [
+            "protective SELL policy independently passes the bounded stop-policy screen, unless disabled",
             "connected near-best multiplier region",
             "positive score delta versus the unchanged control on identical RTH sessions",
             f"paired score improvement of at least {_MIN_PRACTICAL_SCORE_DELTA:.1f} point",
@@ -309,7 +345,11 @@ def market_replay_search_contract(config: MarketReplayConfig) -> dict[str, Any]:
                 "exchange time zone",
                 "minimum tick",
             ],
-            "same_day_overlap_policy": "exclude the complete trading date; never splice fragments",
+            "same_day_overlap_policy": (
+                "stitch the deterministic coverage-first maximal non-overlapping "
+                "fragment set when RTH schedules agree; preserve outages for quality "
+                "gates; never interleave overlapping streams; exclude schedule conflicts"
+            ),
         },
         "strategy_price_priority": [
             "Last when inside a valid spread",
@@ -479,6 +519,14 @@ def _effective_percentage_state(
 
 
 def _profile_distance(left: AtrProfile, right: AtrProfile = _CONTROL_PROFILE) -> float:
+    protective_mode_penalty = 0.0
+    if left.protective_sell_mode != right.protective_sell_mode:
+        protective_mode_penalty = 2.0
+    protective_value_penalty = (
+        abs(left.protective_sell_value - right.protective_sell_value)
+        if left.protective_sell_mode == right.protective_sell_mode
+        else abs(left.protective_sell_value) / 2.0
+    )
     return (
         abs(left.period - right.period) / 10.0
         + abs(left.bar_seconds - right.bar_seconds) / 60.0
@@ -488,6 +536,8 @@ def _profile_distance(left: AtrProfile, right: AtrProfile = _CONTROL_PROFILE) ->
         + abs(left.sell_trail_multiplier - right.sell_trail_multiplier)
         + abs(left.min_atr_pct - right.min_atr_pct) / 0.10
         + abs(left.max_atr_pct - right.max_atr_pct) / 5.0
+        + protective_mode_penalty
+        + protective_value_penalty
     )
 
 
@@ -507,7 +557,10 @@ def _changed_clamp_components(
         or not math.isclose(candidate.min_atr_pct, control.min_atr_pct)
         or not math.isclose(candidate.max_atr_pct, control.max_atr_pct)
     ):
-        return _CLAMP_COMPONENTS
+        changed = list(_CLAMP_COMPONENTS[:-1])
+        if candidate.protective_sell_mode == "atr":
+            changed.append("protective_sell")
+        return tuple(changed)
     changed: list[str] = []
     for component, candidate_value, control_value in (
         (
@@ -533,6 +586,14 @@ def _changed_clamp_components(
     ):
         if not math.isclose(candidate_value, control_value):
             changed.append(component)
+    if (
+        candidate.protective_sell_mode != control.protective_sell_mode
+        or not math.isclose(
+            candidate.protective_sell_value,
+            control.protective_sell_value,
+        )
+    ) and candidate.protective_sell_mode == "atr":
+        changed.append("protective_sell")
     return tuple(changed)
 
 
@@ -736,16 +797,28 @@ def _simulate_session_stateful(
     sell_running_high = carry.sell_running_high
     sell_placed_sequence = carry.sell_placed_sequence
     sell_fill_reference = carry.sell_fill_reference
+    protective_sell_pct = carry.protective_sell_pct
+    protective_stop = carry.protective_stop
+    protective_initial_stop = carry.protective_initial_stop
+    protective_running_high = carry.protective_running_high
+    protective_placed_sequence = carry.protective_placed_sequence
+    protective_fill_reference = carry.protective_fill_reference
+    protective_normal_activation_price = carry.protective_normal_activation_price
     capital = carry.capital
     cycle_number = carry.cycle_number
     carried_position_in = carry.has_open_position
     carried_sell_trail_in = stage in {"SELL_TRAIL", "SELL_FILL_PENDING"}
+    carried_protective_trail_in = stage in {
+        "HOLD",
+        "PROTECTIVE_FILL_PENDING",
+    } and protective_stop is not None
     if carried_position_in and stage == "HOLD":
         # The normal SELL order has not yet been submitted, so its ATR-derived
         # percentages are not locked.  Re-warm the new day's ATR and derive
         # fresh values exactly as BouncyBot would after an overnight hold.
         minimum_profit_pct = None
         sell_trail_pct = None
+        protective_normal_activation_price = None
     # Each .ibrec file can restart its local sequence counter.  A native SELL
     # trail that was placed in an earlier recording must therefore be eligible
     # on the first genuine Last event of the next session; comparing the new
@@ -753,6 +826,8 @@ def _simulate_session_stateful(
     # complete day.
     if carried_sell_trail_in:
         sell_placed_sequence = 0
+    if carried_protective_trail_in:
+        protective_placed_sequence = 0
     active_trade = carry.active_trade
     if carried_position_in and active_trade is not None:
         active_trade.overnight_sessions_held += 1
@@ -776,6 +851,8 @@ def _simulate_session_stateful(
     first_mark_equity: float | None = None
     completed_trade_count = 0
     buys_in_session = 0
+    protective_exits_in_session = 0
+    protective_cancellations_in_session = 0
     trades: list[MarketReplayTrade] = []
     equity_values: list[float] = [session_start_equity]
     first_entry = ""
@@ -797,6 +874,7 @@ def _simulate_session_stateful(
     issues: list[str] = []
     last_bid_update_ns: int | None = None
     last_ask_update_ns: int | None = None
+    last_valid_atr_pct: float | None = None
 
     def refresh_quote_times(tick: IbrecTick) -> None:
         nonlocal last_bid_update_ns, last_ask_update_ns
@@ -866,7 +944,132 @@ def _simulate_session_stateful(
                 first_mark_equity = equity
             equity_values.append(equity)
 
-    def complete_buy(tick: IbrecTick) -> bool:
+    def protective_percentage(
+        atr_pct: float | None,
+        tick: IbrecTick,
+    ) -> float | None:
+        if not profile.protective_sell_enabled:
+            return None
+        if profile.protective_sell_mode == "manual":
+            return round(profile.protective_sell_value, 2)
+        value, state_name = _effective_percentage_state(
+            atr_pct,
+            profile.protective_sell_value,
+            profile,
+            allow_zero=False,
+        )
+        if value is not None:
+            record_clamp("protective_sell", state_name, tick)
+        return value
+
+    def place_protective_sell(
+        tick: IbrecTick,
+        atr_pct: float | None,
+    ) -> bool:
+        nonlocal protective_sell_pct, protective_stop
+        nonlocal protective_initial_stop, protective_running_high
+        nonlocal protective_placed_sequence, protective_fill_reference
+        nonlocal protective_normal_activation_price
+        if not profile.protective_sell_enabled:
+            return False
+        if buy_price is None:
+            raise MarketReplayAnalysisError(
+                "Internal protective SELL state is missing the BUY price."
+            )
+        percentage = protective_percentage(atr_pct, tick)
+        if percentage is None or percentage <= 0:
+            issues.append(
+                "The protective SELL policy was enabled, but its ATR-derived trail could not be calculated at the BUY fill; no protective order was modeled for this position."
+            )
+            return False
+        selected = tick.selected_price()
+        pure_stop = buy_price * (1.0 - percentage / 100.0)
+        reference_values = [
+            value
+            for value in (
+                selected,
+                fresh_bid(tick),
+                _valid(tick.last),
+                _valid(tick.mark_price),
+            )
+            if value is not None
+        ]
+        reference = min(reference_values) if reference_values else buy_price
+        normalized_stop = _round_increment(
+            min(pure_stop, reference * (1.0 - percentage / 100.0)),
+            min_tick,
+            "down",
+        )
+        if normalized_stop <= 0:
+            issues.append(
+                "The protective SELL order was not modeled because its normalized initial stop was non-positive."
+            )
+            return False
+        protective_sell_pct = percentage
+        protective_stop = normalized_stop
+        protective_initial_stop = normalized_stop
+        protective_running_high = _valid(tick.last) or selected or buy_price
+        protective_placed_sequence = tick.sequence
+        protective_fill_reference = None
+        protective_normal_activation_price = None
+        if active_trade is not None:
+            active_trade.protective_sell_mode = profile.protective_sell_mode
+            active_trade.protective_sell_value = profile.protective_sell_value
+            active_trade.protective_sell_pct = percentage
+            active_trade.protective_initial_stop_price = normalized_stop
+        return True
+
+    def cancel_protective_sell() -> bool:
+        nonlocal protective_sell_pct, protective_stop
+        nonlocal protective_initial_stop, protective_running_high
+        nonlocal protective_placed_sequence, protective_fill_reference
+        nonlocal protective_normal_activation_price
+        nonlocal protective_cancellations_in_session
+        if protective_stop is None and protective_fill_reference is None:
+            return False
+        protective_cancellations_in_session += 1
+        protective_sell_pct = None
+        protective_stop = None
+        protective_initial_stop = None
+        protective_running_high = None
+        protective_placed_sequence = 0
+        protective_fill_reference = None
+        protective_normal_activation_price = None
+        return True
+
+    def normal_activation_price_for_atr(
+        atr_pct: float | None,
+    ) -> float | None:
+        """Return the normal SELL activation price at one decision event.
+
+        The value is descriptive evidence for a protective exit. It mirrors
+        the same minimum-profit and SELL-trail calculation used by the HOLD
+        state, but it does not mutate strategy state or clamp counters.
+        """
+
+        if buy_price is None or atr_pct is None:
+            return None
+        profit_pct, _profit_state = _effective_percentage_state(
+            atr_pct,
+            profile.minimum_profit_multiplier,
+            profile,
+            allow_zero=False,
+        )
+        trail_pct, _sell_state = _effective_percentage_state(
+            atr_pct,
+            profile.sell_trail_multiplier,
+            profile,
+            allow_zero=True,
+        )
+        if profit_pct is None or trail_pct is None:
+            return None
+        minimum_stop = buy_price * (1.0 + profit_pct / 100.0)
+        if trail_pct <= 0:
+            return minimum_stop
+        denominator = 1.0 - trail_pct / 100.0
+        return minimum_stop / denominator if denominator > 0 else None
+
+    def complete_buy(tick: IbrecTick, atr_pct: float | None) -> bool:
         nonlocal anchor, buy_fill_reference, buy_price, buy_cost_basis
         nonlocal buy_time, first_entry, stage
         nonlocal last_long_mark, assumed_quantity, total_execution_cost_bps
@@ -913,28 +1116,40 @@ def _simulate_session_stateful(
                 assumed_quantity=assumed_quantity,
                 buy_touch_size=ask_size,
                 buy_touch_sufficient=ask_sufficient,
+                continuity_chain_id=continuity_chain_id,
             )
             trades.append(active_trade)
+        place_protective_sell(tick, atr_pct)
         # Record the immediately executable liquidation value.  This captures
         # the bid/ask spread as drawdown on the fill event itself.
         append_long_mark(tick)
         return True
 
-    def complete_sell(tick: IbrecTick) -> bool:
+    def complete_sell(tick: IbrecTick, *, exit_type: str = "normal") -> bool:
         nonlocal capital, last_exit, stage, anchor, buy_price, buy_cost_basis
-        nonlocal minimum_profit_pct, sell_trail_pct, sell_fill_reference
+        nonlocal minimum_profit_pct, sell_trail_pct, sell_stop
+        nonlocal sell_running_high, sell_placed_sequence, sell_fill_reference
         nonlocal cycle_number, completed_trade_count, last_long_mark
         nonlocal assumed_quantity, total_execution_cost_bps
-        nonlocal active_trade
+        nonlocal active_trade, protective_exits_in_session
+        nonlocal protective_sell_pct, protective_stop
+        nonlocal protective_initial_stop, protective_running_high
+        nonlocal protective_placed_sequence, protective_fill_reference
+        nonlocal protective_normal_activation_price
         bid = fresh_bid(tick)
+        reference = (
+            protective_fill_reference
+            if exit_type == "protective"
+            else sell_fill_reference
+        )
         if (
             bid is None
             or buy_price is None
             or buy_cost_basis is None
-            or sell_fill_reference is None
+            or reference is None
         ):
             return False
-        sell_price = min(sell_fill_reference, bid)
+        sell_price = min(reference, bid)
         net_sell_price = sell_price * (1.0 - sell_execution_cost_rate)
         capital *= net_sell_price / buy_cost_basis
         gross_return_bps = (sell_price / buy_price - 1.0) * 10_000.0
@@ -958,6 +1173,14 @@ def _simulate_session_stateful(
             trade.sell_trigger_pct = sell_trail_pct
             trade.sell_touch_size = bid_size
             trade.sell_touch_sufficient = bid_sufficient
+            trade.exit_type = exit_type
+            if exit_type == "protective":
+                trade.protective_trigger_price = reference
+                trade.normal_activation_price_at_protective_exit = (
+                    protective_normal_activation_price
+                )
+        if exit_type == "protective":
+            protective_exits_in_session += 1
         completed_trade_count += 1
         stage = "WAIT_READY"
         anchor = None
@@ -965,7 +1188,17 @@ def _simulate_session_stateful(
         buy_cost_basis = None
         minimum_profit_pct = None
         sell_trail_pct = None
+        sell_stop = None
+        sell_running_high = None
+        sell_placed_sequence = 0
         sell_fill_reference = None
+        protective_sell_pct = None
+        protective_stop = None
+        protective_initial_stop = None
+        protective_running_high = None
+        protective_placed_sequence = 0
+        protective_fill_reference = None
+        protective_normal_activation_price = None
         last_long_mark = None
         assumed_quantity = 0
         active_trade = None
@@ -977,19 +1210,28 @@ def _simulate_session_stateful(
         refresh_quote_times(tick)
         selected = tick.selected_price()
         atr_pct = atr_values[index]
+        if atr_pct is not None:
+            last_valid_atr_pct = atr_pct
 
         # A native stop becomes a market order when triggered.  The historical
         # Last event proves the trigger, but a fill is not modeled until the
         # recording supplies the executable same-side quote.  Quote-only rows
         # can therefore complete a previously triggered order.
         if stage == "BUY_FILL_PENDING":
-            complete_buy(tick)
+            buy_atr_pct = (
+                atr_pct if atr_pct is not None else last_valid_atr_pct
+            )
+            complete_buy(tick, buy_atr_pct)
             if stage == "BUY_FILL_PENDING":
                 equity_values.append(capital)
             continue
         if stage == "SELL_FILL_PENDING":
             append_long_mark(tick)
             complete_sell(tick)
+            continue
+        if stage == "PROTECTIVE_FILL_PENDING":
+            append_long_mark(tick)
+            complete_sell(tick, exit_type="protective")
             continue
 
         if selected is None:
@@ -1034,7 +1276,10 @@ def _simulate_session_stateful(
             if buy_pct <= 0:
                 buy_fill_reference = selected
                 stage = "BUY_FILL_PENDING"
-                if not complete_buy(tick):
+                buy_atr_pct = (
+                    atr_pct if atr_pct is not None else last_valid_atr_pct
+                )
+                if not complete_buy(tick, buy_atr_pct):
                     equity_values.append(capital)
             else:
                 reference_values = [
@@ -1086,13 +1331,47 @@ def _simulate_session_stateful(
                 continue
             buy_fill_reference = last
             stage = "BUY_FILL_PENDING"
-            if not complete_buy(tick):
+            buy_atr_pct = (
+                atr_pct if atr_pct is not None else last_valid_atr_pct
+            )
+            if not complete_buy(tick, buy_atr_pct):
                 equity_values.append(capital)
             continue
 
         if buy_price is None:
             raise MarketReplayAnalysisError("Internal position state is missing a BUY price.")
         append_long_mark(tick)
+
+        # The protective SELL is a broker-native trailing order.  It follows
+        # favorable Last-price movement from the BUY fill onward and can fire
+        # before the application becomes eligible to replace it with the
+        # normal minimum-profit SELL.  Quote-only callbacks carrying a cached
+        # Last cannot move or trigger the order.
+        if stage == "HOLD" and protective_stop is not None:
+            if tick.sequence > protective_placed_sequence and tick.has_last_event():
+                last = _valid(tick.last)
+                if (
+                    last is not None
+                    and protective_sell_pct is not None
+                    and protective_sell_pct > 0
+                ):
+                    protective_running_high = (
+                        last
+                        if protective_running_high is None
+                        else max(protective_running_high, last)
+                    )
+                    calculated = protective_running_high * (
+                        1.0 - protective_sell_pct / 100.0
+                    )
+                    protective_stop = max(protective_stop, calculated)
+                    if last <= protective_stop:
+                        protective_normal_activation_price = (
+                            normal_activation_price_for_atr(atr_pct)
+                        )
+                        protective_fill_reference = last
+                        stage = "PROTECTIVE_FILL_PENDING"
+                        complete_sell(tick, exit_type="protective")
+                        continue
 
         if stage == "HOLD":
             if atr_pct is None:
@@ -1117,13 +1396,16 @@ def _simulate_session_stateful(
             minimum_profit_pct = profit_pct
             sell_trail_pct = trail_pct
             if trail_pct <= 0:
+                protective_normal_activation_price = minimum_stop
                 if selected < minimum_stop:
                     continue
+                cancel_protective_sell()
                 sell_fill_reference = selected
                 stage = "SELL_FILL_PENDING"
                 complete_sell(tick)
                 continue
             required_price = minimum_stop / (1.0 - trail_pct / 100.0)
+            protective_normal_activation_price = required_price
             if selected < required_price:
                 continue
             reference_values = [
@@ -1147,6 +1429,7 @@ def _simulate_session_stateful(
                 # BouncyBot's controller rejects a normalized normal-SELL stop
                 # that no longer protects the configured minimum-profit floor.
                 continue
+            cancel_protective_sell()
             sell_running_high = _valid(tick.last) or selected
             sell_placed_sequence = tick.sequence
             stage = "SELL_TRAIL"
@@ -1181,7 +1464,13 @@ def _simulate_session_stateful(
         )
     open_entry_price = (
         buy_price
-        if stage in {"HOLD", "SELL_TRAIL", "SELL_FILL_PENDING"}
+        if stage
+        in {
+            "HOLD",
+            "SELL_TRAIL",
+            "SELL_FILL_PENDING",
+            "PROTECTIVE_FILL_PENDING",
+        }
         else None
     )
     open_cost_basis = buy_cost_basis if open_entry_price is not None else None
@@ -1357,6 +1646,19 @@ def _simulate_session_stateful(
         session_end_equity=session_end_equity,
         cumulative_end_equity=session_end_equity,
         overnight_gap_return_bps=overnight_gap_return,
+        protective_exits=protective_exits_in_session,
+        protective_cancellations=protective_cancellations_in_session,
+        protective_trigger_pending_at_end=bool(
+            open_position and stage == "PROTECTIVE_FILL_PENDING"
+        ),
+        carried_protective_trail_in=carried_protective_trail_in,
+        carried_protective_trail_out=bool(
+            can_carry_open_position
+            and (
+                protective_stop is not None
+                or stage == "PROTECTIVE_FILL_PENDING"
+            )
+        ),
     )
 
     next_state = _ReplayCarryState(
@@ -1377,6 +1679,13 @@ def _simulate_session_stateful(
         sell_running_high=sell_running_high,
         sell_placed_sequence=sell_placed_sequence,
         sell_fill_reference=sell_fill_reference,
+        protective_sell_pct=protective_sell_pct,
+        protective_stop=protective_stop,
+        protective_initial_stop=protective_initial_stop,
+        protective_running_high=protective_running_high,
+        protective_placed_sequence=protective_placed_sequence,
+        protective_fill_reference=protective_fill_reference,
+        protective_normal_activation_price=protective_normal_activation_price,
         capital=capital,
         cycle_number=cycle_number,
         last_long_mark=last_long_mark,
@@ -1404,6 +1713,13 @@ def _simulate_session_stateful(
             next_state.sell_running_high = None
             next_state.sell_placed_sequence = 0
             next_state.sell_fill_reference = None
+            next_state.protective_sell_pct = None
+            next_state.protective_stop = None
+            next_state.protective_initial_stop = None
+            next_state.protective_running_high = None
+            next_state.protective_placed_sequence = 0
+            next_state.protective_fill_reference = None
+            next_state.protective_normal_activation_price = None
             next_state.last_long_mark = None
             next_state.active_trade = None
         next_state.last_session_end_equity = session_end_equity
@@ -1532,6 +1848,91 @@ def _evaluate_period_sequence(
         previous = period
     return sessions, trades
 
+
+def _enrich_protective_trade_diagnostics(
+    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    sessions: list[MarketReplaySessionResult],
+    trades: list[MarketReplayTrade],
+) -> None:
+    """Add descriptive post-stop recovery and avoided-loss evidence.
+
+    These diagnostics never affect candidate ranking.  They answer the
+    practical question that follows a protective exit: did the executable bid
+    continue lower, or did it recover to the original BUY/normal activation
+    level before the next modeled entry?  The observation is bounded by the
+    same verified continuity chain and by the next BUY, so it never borrows a
+    later independent trade or an unrecorded overnight path.
+    """
+
+    chain_by_period = {
+        (session.session_date, session.period_id): session.continuity_chain_id
+        for session in sessions
+    }
+    ticks_by_chain: dict[int, list[IbrecTick]] = defaultdict(list)
+    for period, ticks in period_ticks:
+        chain_id = chain_by_period.get((period.session_date, period.period_id))
+        if chain_id is not None:
+            ticks_by_chain[chain_id].extend(ticks)
+    for values in ticks_by_chain.values():
+        values.sort(key=lambda item: (item.timestamp, item.sequence))
+
+    buys_by_chain: dict[int, list[float]] = defaultdict(list)
+    for trade in trades:
+        buy_timestamp = timestamp_seconds(trade.buy_time_utc)
+        if buy_timestamp is not None:
+            buys_by_chain[trade.continuity_chain_id].append(buy_timestamp)
+    for values in buys_by_chain.values():
+        values.sort()
+
+    for trade in trades:
+        if trade.exit_type != "protective" or trade.sell_price is None:
+            continue
+        sell_timestamp = timestamp_seconds(trade.sell_time_utc)
+        if sell_timestamp is None:
+            continue
+        following_buys = [
+            value
+            for value in buys_by_chain.get(trade.continuity_chain_id, [])
+            if value > sell_timestamp + 1e-9
+        ]
+        observation_end = min(following_buys) if following_buys else math.inf
+        observed_ticks = ticks_by_chain.get(trade.continuity_chain_id, [])
+        if following_buys:
+            trade.protective_observation_end_utc = next(
+                (
+                    tick.captured_at_utc
+                    for tick in observed_ticks
+                    if tick.timestamp >= observation_end
+                ),
+                "",
+            )
+        elif observed_ticks:
+            trade.protective_observation_end_utc = observed_ticks[-1].captured_at_utc
+        future_bids = [
+            bid
+            for tick in observed_ticks
+            if sell_timestamp < tick.timestamp < observation_end
+            and (tick.full_snapshot or "bid" in tick.changed_fields)
+            and (bid := tick.valid_bid()) is not None
+        ]
+        if not future_bids:
+            continue
+        future_min = min(future_bids)
+        future_max = max(future_bids)
+        trade.protective_recovered_to_buy = future_max + 1e-9 >= trade.buy_price
+        threshold = trade.normal_activation_price_at_protective_exit
+        trade.protective_reached_normal_activation = (
+            future_max + 1e-9 >= threshold if threshold is not None else None
+        )
+        trade.protective_loss_avoided_bps = max(
+            0.0,
+            (trade.sell_price - future_min) / trade.buy_price * 10_000.0,
+        )
+        trade.protective_regret_bps = max(
+            0.0,
+            (future_max - trade.sell_price) / trade.buy_price * 10_000.0,
+        )
+
 def _summary(
     profile: AtrProfile,
     sessions: list[MarketReplaySessionResult],
@@ -1585,6 +1986,10 @@ def _summary(
     no_trade_fraction = no_trade_count / session_count
     right_censored_fraction = right_censored_count / session_count
     completed_trades = sum(item.completed_trades for item in sessions)
+    protective_exits = sum(item.protective_exits for item in sessions)
+    protective_cancellations = sum(
+        item.protective_cancellations for item in sessions
+    )
     average_completed_trades = score_components["average_completed_trades"]
     turnover_penalty = score_components["turnover_penalty_points"]
     touch_checks = sum(item.touch_liquidity_checks for item in sessions)
@@ -1668,6 +2073,13 @@ def _summary(
         excluded_quality_sessions=sum(
             1 for item in sessions if not item.primary_eligible
         ),
+        protective_exits=protective_exits,
+        protective_cancellations=protective_cancellations,
+        protective_exit_rate_pct=(
+            protective_exits / completed_trades * 100.0
+            if completed_trades
+            else 0.0
+        ),
     )
 
 
@@ -1682,6 +2094,27 @@ def _control_profile(config: MarketReplayConfig) -> AtrProfile:
         sell_trail_multiplier=_CONTROL_PROFILE.sell_trail_multiplier,
         min_atr_pct=normalized.min_atr_pct,
         max_atr_pct=normalized.max_atr_pct,
+        protective_sell_mode="disabled",
+        protective_sell_value=0.0,
+    )
+
+
+def _profile_with_protective_policy(
+    profile: AtrProfile,
+    policy: AtrProfile,
+) -> AtrProfile:
+    """Return ``profile`` with the protective policy from ``policy``.
+
+    The policy layer is intentionally orthogonal to the normal ATR entry and
+    profit-exit parameters.  Keeping the copy operation in one helper prevents
+    stage 1/2 window probes or stage 3 refinement from silently falling back to
+    the disabled default when they are evaluated under a protective policy.
+    """
+
+    return replace(
+        profile,
+        protective_sell_mode=policy.protective_sell_mode,
+        protective_sell_value=policy.protective_sell_value,
     )
 
 
@@ -1689,8 +2122,10 @@ def _window_profile(
     config: MarketReplayConfig,
     period: int,
     bar_seconds: int,
+    *,
+    base_profile: AtrProfile | None = None,
 ) -> AtrProfile:
-    control = _control_profile(config)
+    control = base_profile or _control_profile(config)
     return AtrProfile(
         period=period,
         bar_seconds=bar_seconds,
@@ -1700,6 +2135,8 @@ def _window_profile(
         sell_trail_multiplier=control.sell_trail_multiplier,
         min_atr_pct=control.min_atr_pct,
         max_atr_pct=control.max_atr_pct,
+        protective_sell_mode=control.protective_sell_mode,
+        protective_sell_value=control.protective_sell_value,
     )
 
 
@@ -1707,10 +2144,12 @@ def _window_screen_profiles(
     config: MarketReplayConfig,
     period: int,
     bar_seconds: int,
+    *,
+    base_profile: AtrProfile | None = None,
 ) -> list[AtrProfile]:
     """Return the small representative multiplier set used in stages 1 and 2."""
 
-    control = _control_profile(config)
+    control = base_profile or _control_profile(config)
     profiles = {
         AtrProfile(
             period=period,
@@ -1721,10 +2160,19 @@ def _window_screen_profiles(
             sell_trail_multiplier=sell,
             min_atr_pct=control.min_atr_pct,
             max_atr_pct=control.max_atr_pct,
+            protective_sell_mode=control.protective_sell_mode,
+            protective_sell_value=control.protective_sell_value,
         )
         for initial, buy, profit, sell in _WINDOW_SCREEN_MULTIPLIERS
     }
-    profiles.add(_window_profile(config, period, bar_seconds))
+    profiles.add(
+        _window_profile(
+            config,
+            period,
+            bar_seconds,
+            base_profile=control,
+        )
+    )
     return sorted(profiles, key=lambda profile: profile.key())
 
 
@@ -1771,6 +2219,7 @@ def _coarse_profiles(
     windows: Iterable[tuple[int, int]] | None = None,
     *,
     search_clamps: bool = True,
+    policy_profiles: Iterable[AtrProfile] | None = None,
 ) -> list[AtrProfile]:
     normalized = config.normalized()
     selected_windows = tuple(sorted(set(windows or ((_CONTROL_PROFILE.period, _CONTROL_PROFILE.bar_seconds),))))
@@ -1790,6 +2239,7 @@ def _coarse_profiles(
         if search_clamps
         else (normalized.min_atr_pct,)
     )
+    policies = tuple(policy_profiles or (_control_profile(config),))
     profiles = {
         AtrProfile(
             period=period,
@@ -1800,8 +2250,11 @@ def _coarse_profiles(
             sell_trail_multiplier=sell,
             min_atr_pct=min_atr_pct,
             max_atr_pct=normalized.max_atr_pct,
+            protective_sell_mode=policy.protective_sell_mode,
+            protective_sell_value=policy.protective_sell_value,
         )
         for (
+            policy,
             (period, bar_seconds),
             initial,
             buy,
@@ -1809,6 +2262,7 @@ def _coarse_profiles(
             sell,
             min_atr_pct,
         ) in itertools.product(
+            policies,
             selected_windows,
             _COARSE_INITIAL,
             _COARSE_BUY,
@@ -1818,6 +2272,33 @@ def _coarse_profiles(
         )
     }
     profiles.add(_control_profile(config))
+    return sorted(profiles, key=lambda profile: profile.key())
+
+
+def _coarse_profiles_for_policy_windows(
+    config: MarketReplayConfig,
+    policy_windows: Iterable[tuple[AtrProfile, Iterable[tuple[int, int]]]],
+    *,
+    search_clamps: bool,
+) -> list[AtrProfile]:
+    """Build Stage 3 profiles only inside each policy's selected ATR windows.
+
+    The disabled and enabled protective policies are narrowed independently in
+    Stages 1 and 2. Taking a global union and crossing it with every policy
+    would reintroduce period/bar combinations that did not advance under that
+    policy, weakening the staged-search contract.
+    """
+
+    profiles = {
+        profile
+        for policy, windows in policy_windows
+        for profile in _coarse_profiles(
+            config,
+            windows,
+            search_clamps=search_clamps,
+            policy_profiles=(policy,),
+        )
+    }
     return sorted(profiles, key=lambda profile: profile.key())
 
 
@@ -1857,6 +2338,8 @@ def _refined_profiles(
                     sell_trail_multiplier=sell,
                     min_atr_pct=profile.min_atr_pct,
                     max_atr_pct=profile.max_atr_pct,
+                    protective_sell_mode=profile.protective_sell_mode,
+                    protective_sell_value=profile.protective_sell_value,
                 )
             )
     return sorted(profiles, key=lambda profile: profile.key())
@@ -1875,9 +2358,20 @@ def _refinement_seeds(
     opportunity, then fills remaining slots by within-window rank.
     """
 
-    groups: dict[tuple[int, int], list[MarketReplayCandidateSummary]] = defaultdict(list)
+    groups: dict[
+        tuple[int, int, str, float],
+        list[MarketReplayCandidateSummary],
+    ] = defaultdict(list)
     for candidate in sorted(candidates, key=_candidate_sort_key):
-        groups[(candidate.profile.period, candidate.profile.bar_seconds)].append(candidate)
+        profile = candidate.profile
+        groups[
+            (
+                profile.period,
+                profile.bar_seconds,
+                profile.protective_sell_mode,
+                profile.protective_sell_value,
+            )
+        ].append(candidate)
     windows = sorted(
         groups,
         key=lambda window: (
@@ -2668,11 +3162,15 @@ def _adjacent(left: AtrProfile, right: AtrProfile) -> bool:
         left.bar_seconds,
         left.min_atr_pct,
         left.max_atr_pct,
+        left.protective_sell_mode,
+        left.protective_sell_value,
     ) != (
         right.period,
         right.bar_seconds,
         right.min_atr_pct,
         right.max_atr_pct,
+        right.protective_sell_mode,
+        right.protective_sell_value,
     ):
         return False
     differences = [
@@ -2750,6 +3248,8 @@ def _stable_region_centers(
                 profile.bar_seconds,
                 round(profile.min_atr_pct, 9),
                 round(profile.max_atr_pct, 9),
+                profile.protective_sell_mode,
+                round(profile.protective_sell_value, 9),
                 *(round(float(getattr(profile, name)), 9) for name in other_dimensions),
             )
             grouped[signature].append((float(getattr(profile, dimension)), index))
@@ -2853,7 +3353,10 @@ def _boundary_extension_profiles(
     same_window = [
         item
         for item in all_profiles
-        if item.period == profile.period and item.bar_seconds == profile.bar_seconds
+        if item.period == profile.period
+        and item.bar_seconds == profile.bar_seconds
+        and item.protective_sell_mode == profile.protective_sell_mode
+        and abs(item.protective_sell_value - profile.protective_sell_value) <= 1e-9
     ]
     probes: list[AtrProfile] = []
     rows: list[dict[str, Any]] = []
@@ -3021,6 +3524,8 @@ def _evaluate_profile(
         atr_provider,
         keep_details=keep_details,
     )
+    if keep_details and trades:
+        _enrich_protective_trade_diagnostics(period_ticks, sessions, trades)
     summary_sessions = sessions
     if summary_day_weights is not None:
         summary_sessions = [
@@ -3211,6 +3716,8 @@ def _window_search_rows(
     candidates: list[MarketReplayCandidateSummary],
     selected_windows: set[tuple[int, int]],
     explanation: str,
+    *,
+    policy: AtrProfile | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for rank, candidate in enumerate(sorted(candidates, key=_candidate_sort_key), start=1):
@@ -3227,6 +3734,12 @@ def _window_search_rows(
                 "sessions_with_trades": candidate.sessions_with_trades,
                 "right_censored_rate_pct": candidate.right_censored_rate_pct,
                 "profile_key": candidate.profile.key(),
+                "protective_sell_mode": candidate.profile.protective_sell_mode,
+                "protective_sell_value": candidate.profile.protective_sell_value,
+                "protective_policy_label": candidate.profile.protective_policy_label,
+                "window_search_policy": (
+                    policy.protective_policy_label if policy is not None else "Disabled"
+                ),
                 "selection_basis": explanation,
             }
         )
@@ -3276,13 +3789,15 @@ def _select_windows(
     *,
     progress: ProgressCallback | None,
     summary_day_weights: dict[str, int] | None = None,
+    base_profile: AtrProfile | None = None,
 ) -> tuple[
     list[tuple[int, int]],
     list[dict[str, Any]],
     list[AtrProfile],
     list[AtrProfile],
 ]:
-    control_window = (_CONTROL_PROFILE.period, _CONTROL_PROFILE.bar_seconds)
+    policy = base_profile or _control_profile(config)
+    control_window = (policy.period, policy.bar_seconds)
 
     stage1_windows = [
         (_STAGE1_FIXED_PERIOD, bar_seconds)
@@ -3298,7 +3813,12 @@ def _select_windows(
     stage1_profiles = [
         profile
         for period, bar_seconds in stage1_windows
-        for profile in _window_screen_profiles(config, period, bar_seconds)
+        for profile in _window_screen_profiles(
+            config,
+            period,
+            bar_seconds,
+            base_profile=policy,
+        )
     ]
     _evaluate_profiles(
         recording,
@@ -3319,6 +3839,7 @@ def _select_windows(
         stage1_candidates,
         {(_STAGE1_FIXED_PERIOD, value) for value in selected_bars},
         "Period was fixed at 14. Each bar duration was screened with the same small representative multiplier mini-grid; the strongest result for each duration determined advancement.",
+        policy=policy,
     )
 
     # Precompute every period/bar pair so leave-one-day-out reruns can select a
@@ -3342,7 +3863,12 @@ def _select_windows(
     all_stage2_profiles = [
         profile
         for period, bar_seconds in sorted(all_stage2_windows)
-        for profile in _window_screen_profiles(config, period, bar_seconds)
+        for profile in _window_screen_profiles(
+            config,
+            period,
+            bar_seconds,
+            base_profile=policy,
+        )
     ]
     _evaluate_profiles(
         recording,
@@ -3371,6 +3897,7 @@ def _select_windows(
             stage2_candidates,
             selected_window_set,
             "Periods were compared only inside the strongest stage-1 bar durations. Every period/bar window used the same representative multiplier mini-grid; the unchanged 14×60 control window was always retained.",
+            policy=policy,
         )
     )
     rows.extend(
@@ -3390,9 +3917,356 @@ def _select_windows(
             ],
             selected_window_set,
             "Only these narrowed ATR windows entered the full entry/exit multiplier grid and local multiplier refinement.",
+            policy=policy,
         )
     )
     return selected_windows, rows, stage1_profiles, all_stage2_profiles
+
+
+def _protective_policy_profiles(config: MarketReplayConfig) -> list[AtrProfile]:
+    """Return the bounded protective-policy screen around the control ATR profile."""
+
+    control = _control_profile(config)
+    profiles = {control}
+    profiles.update(
+        replace(
+            control,
+            protective_sell_mode="manual",
+            protective_sell_value=value,
+        )
+        for value in _PROTECTIVE_MANUAL_TRAILS
+    )
+    profiles.update(
+        replace(
+            control,
+            protective_sell_mode="atr",
+            protective_sell_value=value,
+        )
+        for value in _PROTECTIVE_ATR_MULTIPLIERS
+    )
+    return sorted(profiles, key=lambda item: item.key())
+
+
+def _protective_policy_components(
+    candidates: list[MarketReplayCandidateSummary],
+) -> list[list[MarketReplayCandidateSummary]]:
+    """Return supported adjacent near-best manual/ATR policy components."""
+
+    components: list[list[MarketReplayCandidateSummary]] = []
+    for mode, step in (
+        ("manual", _PROTECTIVE_MANUAL_STEP),
+        ("atr", _PROTECTIVE_ATR_STEP),
+    ):
+        mode_candidates = sorted(
+            (
+                item
+                for item in candidates
+                if item.profile.protective_sell_mode == mode
+            ),
+            key=lambda item: (
+                item.profile.protective_sell_value,
+                item.profile.key(),
+            ),
+        )
+        if not mode_candidates:
+            continue
+        best_score = max(item.score for item in mode_candidates)
+        tolerance = max(2.0, abs(best_score) * 0.10)
+        near = [
+            item for item in mode_candidates if item.score >= best_score - tolerance
+        ]
+        current: list[MarketReplayCandidateSummary] = []
+        for candidate in near:
+            if not current:
+                current = [candidate]
+                continue
+            previous = current[-1]
+            difference = (
+                candidate.profile.protective_sell_value
+                - previous.profile.protective_sell_value
+            )
+            if 1e-9 < difference <= step + 1e-9:
+                current.append(candidate)
+            else:
+                if len(current) >= _PROTECTIVE_MIN_REGION_SIZE:
+                    components.append(current)
+                current = [candidate]
+        if len(current) >= _PROTECTIVE_MIN_REGION_SIZE:
+            components.append(current)
+    return components
+
+
+def _protective_policy_center(
+    component: list[MarketReplayCandidateSummary],
+) -> MarketReplayCandidateSummary:
+    values = [item.profile.protective_sell_value for item in component]
+    center_value = float(statistics.median(values))
+    return min(
+        component,
+        key=lambda item: (
+            abs(item.profile.protective_sell_value - center_value),
+            -item.score,
+            item.profile.key(),
+        ),
+    )
+
+
+def _select_protective_policy(
+    recording: IbrecRecording,
+    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    config: MarketReplayConfig,
+    atr_cache: dict[AtrCacheKey, list[float | None]],
+    summaries: dict[str, MarketReplayCandidateSummary],
+    sessions_by_profile: dict[str, list[MarketReplaySessionResult]],
+    *,
+    progress: ProgressCallback | None,
+    summary_day_weights: dict[str, int] | None = None,
+    collect_diagnostics: bool = False,
+) -> tuple[list[AtrProfile], list[dict[str, Any]], str]:
+    """Choose at most one protective policy for conditional ATR optimization.
+
+    This is a bounded risk-policy screen at the unchanged ATR profile.  It is
+    deliberately separate from the later ATR search so a large combined grid
+    cannot manufacture an apparently precise stop policy from sparse data.
+    The final robust authorization still compares the complete selected
+    profile against the disabled control.
+    """
+
+    control = _control_profile(config)
+    if not config.normalized().protective_policy_search_enabled:
+        return [control], [
+            {
+                "mode": "disabled",
+                "value": 0.0,
+                "label": control.protective_policy_label,
+                "profile_key": control.key(),
+                "selected_for_atr_search": True,
+                "eligible": True,
+                "decision": "Protective-policy search was disabled by configuration.",
+            }
+        ], "Protective-policy search was disabled; only the no-stop control was evaluated."
+
+    profiles = _protective_policy_profiles(config)
+    _ensure_atr_windows(
+        period_ticks,
+        atr_cache,
+        [(control.period, control.bar_seconds)],
+        progress=progress,
+        message="Protective policy: reconstructing control ATR window",
+    )
+    _evaluate_profiles(
+        recording,
+        period_ticks,
+        atr_cache,
+        profiles,
+        summaries,
+        sessions_by_profile,
+        config,
+        progress=progress,
+        message="Protective policy: comparing disabled, manual, and ATR-adaptive trails",
+        summary_day_weights=summary_day_weights,
+    )
+    candidates = [summaries[profile.key()] for profile in profiles]
+    disabled = summaries[control.key()]
+    trading_days = len({period.session_date for period, _ in period_ticks})
+    component_rows: dict[str, tuple[str, int]] = {}
+    centers: list[MarketReplayCandidateSummary] = []
+    for component in _protective_policy_components(candidates):
+        center = _protective_policy_center(component)
+        region_id = "PROTECTIVE-" + hashlib.sha256(
+            "|".join(item.profile.key() for item in component).encode("utf-8")
+        ).hexdigest()[:10].upper()
+        for item in component:
+            component_rows[item.profile.key()] = (region_id, len(component))
+        centers.append(center)
+
+    eligible: list[MarketReplayCandidateSummary] = []
+    decisions: dict[str, list[str]] = defaultdict(list)
+    for center in centers:
+        sessions = sessions_by_profile.get(center.profile.key(), [])
+        protective_days = len(
+            {
+                item.session_date
+                for item in sessions
+                if item.protective_exits > 0
+            }
+        )
+        score_delta = center.score - disabled.score
+        if trading_days < _MIN_ROBUST_TRADING_DAYS:
+            decisions[center.profile.key()].append(
+                f"Only {trading_days} trading day(s) were available; at least {_MIN_ROBUST_TRADING_DAYS} are required."
+            )
+        if center.protective_exits < 3 or protective_days < 3:
+            decisions[center.profile.key()].append(
+                "Fewer than three protective exits across three trading days were observed."
+            )
+        if score_delta < _MIN_PRACTICAL_SCORE_DELTA:
+            decisions[center.profile.key()].append(
+                f"The score improvement ({score_delta:.3f}) was below the {_MIN_PRACTICAL_SCORE_DELTA:.3f}-point practical threshold."
+            )
+        if (
+            center.maximum_drawdown_bps
+            > disabled.maximum_drawdown_bps + _MAX_DRAWDOWN_DETERIORATION_BPS
+        ):
+            decisions[center.profile.key()].append(
+                "Maximum drawdown deteriorated materially versus the disabled control."
+            )
+        if (
+            center.worst_return_bps
+            < disabled.worst_return_bps - _MAX_WORST_RETURN_DETERIORATION_BPS
+        ):
+            decisions[center.profile.key()].append(
+                "Worst-session return deteriorated materially versus the disabled control."
+            )
+        if center.profile.protective_sell_mode == "atr":
+            rates = center.clamp_component_rates_pct.get("protective_sell", {})
+            if max(float(rates.get("min", 0.0)), float(rates.get("max", 0.0))) >= _MAX_CHANGED_PROFILE_CLAMP_RATE_PCT:
+                decisions[center.profile.key()].append(
+                    "The ATR-adaptive protective trail was clamp-bound at least 90% of the time, so its multiplier was not identifiable."
+                )
+        if not decisions[center.profile.key()]:
+            center.protective_policy_stable = True
+            eligible.append(center)
+
+    selected = (
+        min(
+            eligible,
+            key=lambda item: (
+                -(item.score - disabled.score),
+                item.maximum_drawdown_bps - disabled.maximum_drawdown_bps,
+                -item.worst_return_bps,
+                _profile_distance(item.profile, control),
+                item.profile.key(),
+            ),
+        )
+        if eligible
+        else disabled
+    )
+    diagnostic_rows: dict[str, dict[str, Any]] = {}
+    if collect_diagnostics:
+        for profile in profiles:
+            _detail, _sessions, trades = _evaluate_profile(
+                recording,
+                period_ticks,
+                atr_cache,
+                profile,
+                config,
+                keep_details=True,
+                summary_day_weights=summary_day_weights,
+            )
+            protective_trades = [
+                trade for trade in trades if trade.exit_type == "protective"
+            ]
+            recovery_observed = [
+                trade
+                for trade in protective_trades
+                if trade.protective_recovered_to_buy is not None
+            ]
+            activation_observed = [
+                trade
+                for trade in protective_trades
+                if trade.protective_reached_normal_activation is not None
+            ]
+            loss_avoided = [
+                float(trade.protective_loss_avoided_bps)
+                for trade in protective_trades
+                if trade.protective_loss_avoided_bps is not None
+                and math.isfinite(trade.protective_loss_avoided_bps)
+            ]
+            regret = [
+                float(trade.protective_regret_bps)
+                for trade in protective_trades
+                if trade.protective_regret_bps is not None
+                and math.isfinite(trade.protective_regret_bps)
+            ]
+            recovered_count = sum(
+                1 for trade in recovery_observed if trade.protective_recovered_to_buy
+            )
+            activation_count = sum(
+                1
+                for trade in activation_observed
+                if trade.protective_reached_normal_activation
+            )
+            diagnostic_rows[profile.key()] = {
+                "diagnostic_protective_exits": len(protective_trades),
+                "recovery_observed_exits": len(recovery_observed),
+                "recovered_to_buy_count": recovered_count,
+                "recovered_to_buy_pct": (
+                    recovered_count / len(recovery_observed) * 100.0
+                    if recovery_observed
+                    else None
+                ),
+                "normal_activation_observed_exits": len(activation_observed),
+                "later_reached_normal_activation_count": activation_count,
+                "later_reached_normal_activation_pct": (
+                    activation_count / len(activation_observed) * 100.0
+                    if activation_observed
+                    else None
+                ),
+                "median_further_loss_avoided_bps": (
+                    float(statistics.median(loss_avoided)) if loss_avoided else None
+                ),
+                "median_recovery_regret_bps": (
+                    float(statistics.median(regret)) if regret else None
+                ),
+                "overnight_protective_exits": sum(
+                    1
+                    for trade in protective_trades
+                    if trade.overnight_sessions_held > 0
+                ),
+            }
+    evidence: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=_candidate_sort_key):
+        region_id, region_size = component_rows.get(candidate.profile.key(), ("", 0))
+        reasons = decisions.get(candidate.profile.key(), [])
+        evidence.append(
+            {
+                "mode": candidate.profile.protective_sell_mode,
+                "value": candidate.profile.protective_sell_value,
+                "label": candidate.profile.protective_policy_label,
+                "profile_key": candidate.profile.key(),
+                "score": candidate.score,
+                "score_delta_vs_disabled": candidate.score - disabled.score,
+                "median_return_bps": candidate.median_return_bps,
+                "mean_return_bps": candidate.mean_return_bps,
+                "worst_return_bps": candidate.worst_return_bps,
+                "maximum_drawdown_bps": candidate.maximum_drawdown_bps,
+                "completed_trades": candidate.completed_trades,
+                "protective_exits": candidate.protective_exits,
+                "protective_cancellations": candidate.protective_cancellations,
+                "protective_exit_rate_pct": candidate.protective_exit_rate_pct,
+                "stable_region_id": region_id,
+                "stable_region_size": region_size,
+                "stable_region_center": candidate in centers,
+                "selected_policy": candidate is selected,
+                "eligible": candidate in eligible or candidate.profile.protective_sell_mode == "disabled",
+                "selected_for_atr_search": candidate.profile.key() in {
+                    disabled.profile.key(),
+                    selected.profile.key(),
+                },
+                "decision": (
+                    "Passed the bounded protective-policy screen."
+                    if candidate in eligible
+                    else "Disabled reference policy."
+                    if candidate.profile.protective_sell_mode == "disabled"
+                    else "; ".join(reasons)
+                    if reasons
+                    else "Not the center of a supported adjacent policy region."
+                ),
+                **diagnostic_rows.get(candidate.profile.key(), {}),
+            }
+        )
+    if selected is disabled:
+        reason = (
+            "No enabled protective SELL policy passed the bounded stability, sample, score, tail-risk, and clamp-identifiability screen. "
+            "The full ATR search therefore retained the disabled control only."
+        )
+        return [control], evidence, reason
+    reason = (
+        f"{selected.profile.protective_policy_label} was the center of the strongest supported protective-policy region at the unchanged ATR profile. "
+        "The full ATR search evaluated that policy and the disabled control separately."
+    )
+    return [control, selected.profile], evidence, reason
 
 
 def _run_bounded_selector(
@@ -3412,18 +4286,41 @@ def _run_bounded_selector(
     atr_cache: dict[AtrCacheKey, list[float | None]] = {}
     summaries: dict[str, MarketReplayCandidateSummary] = {}
     sessions_by_profile: dict[str, list[MarketReplaySessionResult]] = {}
-    selected_windows, window_search, _, _ = _select_windows(
+    policy_profiles, protective_evidence, protective_reason = _select_protective_policy(
         recording,
         period_ticks,
         config,
         atr_cache,
         summaries,
         sessions_by_profile,
-        False,
         progress=progress,
         summary_day_weights=day_weights,
     )
-    profiles = _coarse_profiles(config, selected_windows, search_clamps=True)
+    selected_window_set: set[tuple[int, int]] = set()
+    policy_window_sets: list[tuple[AtrProfile, list[tuple[int, int]]]] = []
+    window_search: list[dict[str, Any]] = []
+    for policy in policy_profiles:
+        policy_windows, policy_rows, _, _ = _select_windows(
+            recording,
+            period_ticks,
+            config,
+            atr_cache,
+            summaries,
+            sessions_by_profile,
+            False,
+            progress=progress,
+            summary_day_weights=day_weights,
+            base_profile=policy,
+        )
+        selected_window_set.update(policy_windows)
+        policy_window_sets.append((policy, policy_windows))
+        window_search.extend(policy_rows)
+    selected_windows = sorted(selected_window_set)
+    profiles = _coarse_profiles_for_policy_windows(
+        config,
+        policy_window_sets,
+        search_clamps=True,
+    )
     _evaluate_profiles(
         recording,
         period_ticks,
@@ -3501,6 +4398,8 @@ def _run_bounded_selector(
         sessions_by_profile=sessions_by_profile,
         atr_cache=atr_cache,
         window_search=window_search,
+        protective_policy_evidence=protective_evidence,
+        protective_policy_reason=protective_reason,
     )
 
 
@@ -4434,6 +5333,7 @@ def _copy_selection_evidence(
     ]
     target.assumption_stress_all_positive = source.assumption_stress_all_positive
     target.recommendation_gates = [dict(row) for row in source.recommendation_gates]
+    target.protective_policy_stable = source.protective_policy_stable
 
 
 def run_market_replay_analysis(
@@ -4516,7 +5416,10 @@ def run_market_replay_analysis(
                     "period_id": quality.period_id,
                     "period_count": 1,
                     "source_recording_sha256": quality.source_recording_sha256,
-                    "recording_hashes": [quality.source_recording_sha256],
+                    "recording_hashes": list(
+                        quality.source_recording_sha256s
+                        or (quality.source_recording_sha256,)
+                    ),
                     "coverage_pct": quality.coverage_pct,
                     "reason": " | ".join(quality.exclusion_reasons),
                     "reasons": list(quality.exclusion_reasons),
@@ -4537,20 +5440,46 @@ def run_market_replay_analysis(
     atr_cache: dict[AtrCacheKey, list[float | None]] = {}
     summaries: dict[str, MarketReplayCandidateSummary] = {}
     sessions_by_profile: dict[str, list[MarketReplaySessionResult]] = {}
-    selected_windows, window_search, stage1_profiles, stage2_profiles = _select_windows(
+    policy_profiles, protective_policy_evidence, protective_policy_reason = _select_protective_policy(
         recording,
         period_ticks,
         normalized,
         atr_cache,
         summaries,
         sessions_by_profile,
-        robustness_possible,
         progress=progress,
+        collect_diagnostics=True,
     )
-
-    coarse_profiles = _coarse_profiles(
+    supported_protective_policies = {
+        (str(row.get("mode") or ""), float(row.get("value") or 0.0))
+        for row in protective_policy_evidence
+        if bool(row.get("selected_for_atr_search"))
+        and bool(row.get("eligible"))
+        and str(row.get("mode") or "") != "disabled"
+    }
+    policy_window_sets: list[tuple[AtrProfile, list[tuple[int, int]]]] = []
+    window_search: list[dict[str, Any]] = []
+    stage1_profiles: list[AtrProfile] = []
+    stage2_profiles: list[AtrProfile] = []
+    for policy in policy_profiles:
+        policy_windows, policy_rows, policy_stage1, policy_stage2 = _select_windows(
+            recording,
+            period_ticks,
+            normalized,
+            atr_cache,
+            summaries,
+            sessions_by_profile,
+            robustness_possible,
+            progress=progress,
+            base_profile=policy,
+        )
+        policy_window_sets.append((policy, policy_windows))
+        window_search.extend(policy_rows)
+        stage1_profiles.extend(policy_stage1)
+        stage2_profiles.extend(policy_stage2)
+    coarse_profiles = _coarse_profiles_for_policy_windows(
         normalized,
-        selected_windows,
+        policy_window_sets,
         search_clamps=robustness_possible,
     )
     _evaluate_profiles(
@@ -4868,6 +5797,16 @@ def run_market_replay_analysis(
             {"profile_key": center_key, **continuity_result}
         )
 
+        protective_policy_key = (
+            center.profile.protective_sell_mode,
+            center.profile.protective_sell_value,
+        )
+        protective_policy_passed = (
+            center.profile.protective_sell_mode == "disabled"
+            or protective_policy_key in supported_protective_policies
+        )
+        center.protective_policy_stable = protective_policy_passed
+
         pre_advanced_passed = (
             base_passed
             and bool(phase_evidence.get("atr_phase_passed"))
@@ -4875,6 +5814,7 @@ def run_market_replay_analysis(
             and center.pareto_frontier
             and center.boundary_resolved
             and bool(continuity_result.get("passed"))
+            and protective_policy_passed
         )
         if pre_advanced_passed:
             moving_result = _moving_block_robustness(
@@ -5035,61 +5975,73 @@ def run_market_replay_analysis(
                     "detail": region_reason,
                 },
                 {
-                    "gate_key": "03_paired_bootstrap_and_loo",
+                    "gate_key": "03_protective_policy",
+                    "gate_label": "Protective SELL policy stability",
+                    "passed": protective_policy_passed,
+                    "detail": (
+                        "Protective SELL is disabled for this profile."
+                        if center.profile.protective_sell_mode == "disabled"
+                        else protective_policy_reason
+                        if protective_policy_passed
+                        else "The profile uses a protective SELL policy that did not pass the independent bounded policy screen."
+                    ),
+                },
+                {
+                    "gate_key": "04_paired_bootstrap_and_loo",
                     "gate_label": "Paired bootstrap and exact leave-one-day-out",
                     "passed": base_passed,
                     "detail": " | ".join(evidence.get("failure_reasons") or []) or "Passed.",
                 },
                 {
-                    "gate_key": "04_atr_phase",
+                    "gate_key": "05_atr_phase",
                     "gate_label": "ATR bar-phase stress",
                     "passed": bool(phase_evidence.get("atr_phase_passed")),
                     "detail": " | ".join(phase_evidence.get("atr_phase_failure_reasons") or []) or "Passed.",
                 },
                 {
-                    "gate_key": "05_score_policies",
+                    "gate_key": "06_score_policies",
                     "gate_label": "Score-policy stability",
                     "passed": policy_passed,
                     "detail": "All predefined score policies favored the candidate." if policy_passed else "At least one predefined score policy did not favor the candidate.",
                 },
                 {
-                    "gate_key": "06_pareto",
+                    "gate_key": "07_pareto",
                     "gate_label": "Pareto frontier",
                     "passed": center.pareto_frontier,
                     "detail": "Candidate is non-dominated." if center.pareto_frontier else f"Dominated by {', '.join(dominators)}.",
                 },
                 {
-                    "gate_key": "07_search_boundary",
+                    "gate_key": "08_search_boundary",
                     "gate_label": "Search-boundary support",
                     "passed": center.boundary_resolved,
                     "detail": "Search boundary resolved." if center.boundary_resolved else f"Unresolved dimensions: {', '.join(boundary_result['unresolved_dimensions'])}.",
                 },
                 {
-                    "gate_key": "08_economic_continuity",
+                    "gate_key": "09_economic_continuity",
                     "gate_label": "Economic continuity blocks",
                     "passed": bool(continuity_result.get("passed")),
                     "detail": " | ".join(continuity_result.get("failure_reasons") or []) or "Passed.",
                 },
                 {
-                    "gate_key": "09_moving_block",
+                    "gate_key": "10_moving_block",
                     "gate_label": "Moving-block bootstrap",
                     "passed": bool(moving_result.get("passed")),
                     "detail": " | ".join(moving_result.get("failure_reasons") or []) or "Passed.",
                 },
                 {
-                    "gate_key": "10_assumption_stress",
+                    "gate_key": "11_assumption_stress",
                     "gate_label": "Assumption stress",
                     "passed": bool(stress_result.get("passed")),
                     "detail": " | ".join(stress_result.get("failure_reasons") or []) or "Passed.",
                 },
                 {
-                    "gate_key": "11_walk_forward",
+                    "gate_key": "12_walk_forward",
                     "gate_label": "Chronological walk-forward",
                     "passed": bool(walk_result.get("passed")),
                     "detail": " | ".join(walk_result.get("failure_reasons") or []) or "Passed.",
                 },
                 {
-                    "gate_key": "12_selection_bootstrap",
+                    "gate_key": "13_selection_bootstrap",
                     "gate_label": "Selection-aware bootstrap",
                     "passed": bool(selection_result.get("passed")),
                     "detail": " | ".join(selection_result.get("failure_reasons") or []) or "Passed.",
@@ -5341,6 +6293,7 @@ def run_market_replay_analysis(
     issues.extend(
         f"Execution calibration: {warning}" for warning in calibration.warnings
     )
+    issues.append(f"Protective SELL policy screen: {protective_policy_reason}")
     observed_durations = [
         max(
             0.0,
@@ -5374,6 +6327,11 @@ def run_market_replay_analysis(
             "carried_position_out": session.carried_position_out,
             "carried_sell_trail_in": session.carried_sell_trail_in,
             "carried_sell_trail_out": session.carried_sell_trail_out,
+            "carried_protective_trail_in": session.carried_protective_trail_in,
+            "carried_protective_trail_out": session.carried_protective_trail_out,
+            "protective_trigger_pending_at_end": (
+                session.protective_trigger_pending_at_end
+            ),
             "terminal_open_position": session.terminal_open_position,
             "session_start_equity": session.session_start_equity,
             "session_end_equity": session.session_end_equity,
@@ -5413,5 +6371,6 @@ def run_market_replay_analysis(
         boundary_evidence=boundary_evidence,
         assumption_stress_evidence=assumption_stress_evidence,
         recommendation_gates=recommendation_gate_evidence,
+        protective_policy_evidence=protective_policy_evidence,
         exploratory_only=exploratory_only,
     )

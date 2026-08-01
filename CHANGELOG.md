@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.0.1 — 2026-08-01
+
+Ruff F841 quality-gate correction release.
+
+- Removed the unused `selected_windows` local and its now-redundant aggregation from the top-level Market Replay analysis after policy-specific ATR windows had already been retained in `policy_window_sets`.
+- Added an AST regression test that protects the exact correction.
+- Kept ATR reconstruction, protective-policy selection, staged search, replay, calibration, robustness validation, scoring, reports, and recommendations unchanged.
+- Cleaned generated pytest and bytecode cache files from the published source archive.
+
+## 2.0.0 — 2026-07-31
+
+Protective-SELL policy optimization release.
+
+- Added a separate bounded Market Replay risk-policy stage that compares protective SELL disabled with manual 1–5% and ATR-adaptive 1.5–4.5x native trailing SELL policies at the unchanged ATR control.
+- Requires an adjacent multi-point policy region, minimum protective-exit/day evidence, practical score improvement, tail-risk non-inferiority, and ATR-clamp identifiability before one enabled policy can advance.
+- Runs the three-stage ATR-window and multiplier search separately for the disabled control and the one supported enabled policy, preventing one policy from borrowing another policy's selected ATR windows.
+- Requires the final complete ATR-plus-protective-policy profile to pass all existing paired, bootstrap, leave-one-day-out, phase, policy, Pareto, boundary, stress, continuity, selection-aware, and walk-forward authorization gates.
+- Models protective placement immediately after BUY, controller-style stop normalization, genuine-Last native trailing behavior, fresh-bid market fills, overnight carry, pending fills, and cancellation before normal profit-taking SELL replacement.
+- Adds descriptive stop-out recovery, later normal-activation, additional-loss-avoided, recovery-regret, and overnight-exit diagnostics without using those hindsight diagnostics to rank candidates.
+- Adds `protective_sell_policy_comparison.csv`, `protective_sell_trade_diagnostics.csv`, corresponding HTML/JSON evidence, and protective fields throughout candidate, session, continuity, and recommendation exports.
+- Advances the Market Replay analysis contract to version 15 and adds focused regression tests for protective order semantics, policy-region selection, policy-specific ATR-window search, overnight behavior, report contracts, and conservative fallback.
+
+## 1.9.4 — 2026-07-28
+
+Same-date Market Replay fragment-merging and diagnostic-evidence release.
+
+- Stitches verified non-overlapping same-date RTH fragments instead of excluding the complete date. The deterministic selector prioritizes wall-clock coverage, then live-only coverage, normal-close evidence, retained strategy rows, fewer stitches, and a content-derived tie-break.
+- Preserves real inter-fragment outages in the rebased monotonic clock so ATR freshness, quote age, event-gap, and Last-density quality gates remain authoritative. Overlapping tick streams are never interleaved.
+- Excludes a date when retained same-date fragments disagree on scheduled RTH boundaries; empty fragments cannot invalidate otherwise usable evidence.
+- Deduplicates an identical shared boundary row, rejects conflicting equal-time boundaries, and never stitches a fragment whose receipt clock reverses.
+- Corrected the interval selector so boundary compatibility is checked against the actual final fragment in each candidate chain rather than an unrelated best prefix with the same end time.
+- Resolves format, manifest, and connectivity provenance across every recording contributing to a merged period; incomplete provenance fails closed.
+- Adds `recording_fragment_evidence.csv` plus HTML/JSON fragment diagnostics and individual recording hashes in quality exclusions.
+- Names the offending file for multi-recording preflight/load failures and rejects zero-row recordings during preflight.
+- Advances the Market Replay analysis contract to version 14 and adds regression tests for coverage-first selection, schedule conflicts, empty fragments, merged gaps, clock reversal, exact boundary handling, chain compatibility, provenance, report evidence, input-order determinism, and filename diagnostics.
+
 ## 1.9.3 — 2026-07-28
 
 Calibration date-key correction and report-integrity release.

@@ -274,7 +274,7 @@ No row is called globally optimal. Every proposed setting requires forward paper
 
 One or more format-2 ZIP and/or format-3 SQLite `.ibrec` recordings are copied independently into a private temporary directory. Every selected recording must describe the same provable instrument identity: symbol, positive conId, currency, security type, exchange time zone, and minimum tick. Duplicate paths and duplicate recording content are rejected. Format 2 validates the manifest, tick schema, checksums when supplied, and bounded archive limits. Format 3 validates schema and SQLite integrity, then verifies every tick/event/RTH record hash, tick and event chain, RTH digest, and latest committed checkpoint. Every original input component is re-hashed after analysis.
 
-The combined dataset contains at most one unambiguous RTH period per calendar trading date. When overlapping files or interrupted fragments provide more than one period for a date, the complete date is excluded rather than spliced. The optimizer cannot prove that ATR bars, the moving anchor, native trailing-order state, or position state were continuous across separate fragments. Input order, original filenames, absolute paths, and Python hash seed do not affect the content-derived analysis identity.
+The combined dataset contains at most one RTH period per calendar trading date. Verified same-date fragments with matching scheduled boundaries are reduced to a deterministic maximal non-overlapping subset. Selection maximizes observed wall-clock coverage, then live-only coverage, normal-close evidence, retained strategy rows, and fewer fragments, with a content-derived final tie-break. Selected fragments are stitched chronologically; each keeps its own monotonic spacing and later fragments are shifted by their wall-clock offset from the first. The resulting clock is strictly increasing, but the true outage remains visible to ATR freshness, quote age, event-gap, and Last-density gates. Overlapping streams are never interleaved. Conflicting schedules exclude the date. Input order, original filenames, absolute paths, and Python hash seed do not affect the content-derived analysis identity.
 
 All raw events are validated before a replay projection is built. The projection retains all Last events, full snapshots, selected-price/quote/mark/close changes, feed changes, first/final rows, and at least one usable state per UTC second. Only redundant size-, volume-, or high/low-only events can be omitted. Reports expose both row counts.
 
@@ -360,7 +360,7 @@ The result remains a bounded, in-sample paper-testing candidate. It is not a pro
 
 ## Version 1.6 Market Replay recording sets and final authorization gates
 
-One Market Replay analysis may contain several v2/v3 recordings, but only for one provably identical instrument. Files are ordered by path-independent component fingerprints. Duplicate content is rejected. The analysis includes exactly one unambiguous RTH period per calendar trading date; overlapping files and interrupted same-day fragments are exported as exclusions rather than merged.
+One Market Replay analysis may contain several v2/v3 recordings, but only for one provably identical instrument. Files are ordered by path-independent component fingerprints. Duplicate content is rejected. The analysis produces exactly one RTH period per calendar trading date. Compatible non-overlapping fragments are stitched and exported in `recording_fragment_evidence.csv`; overlapping fragments are dropped deterministically rather than interleaved, and schedule conflicts are exported as date exclusions.
 
 ATR OHLC buckets use recorder `elapsed_ns`, matching BouncyBot's monotonic-clock basis more closely than receipt-wall-clock UTC. The canonical search uses the stored elapsed phase. Because the absolute phase of BouncyBot's process monotonic clock is unavailable, every changed candidate is additionally evaluated over five-second phase offsets for candidate and control bar sizes. A deliberately adverse per-session phase aggregation must also remain above control.
 
@@ -372,7 +372,7 @@ The three-stage search is rerun after every omitted trading day: stage 1 bar-dur
 
 The Market Replay state machine can now preserve an unresolved long position across provably consecutive, complete, primary-quality RTH recordings. It carries the modeled BUY cost basis and quantity, realized equity, continuity-chain drawdown, and—when already submitted—the locked native SELL trail, running high, and stop. An unsubmitted SELL is not frozen across the boundary: the next RTH session must reconstruct and warm its ATR before minimum-profit activation and trail submission can occur. BUY trails are never carried because the standardized strategy cancels them before the close.
 
-Continuity is deliberately fail-closed. Both adjacent sessions must pass the primary quality gate, dates must be conservatively consecutive under the built-in weekday rule, and the closing session must contain a valid post-entry bid mark. Friday-to-Monday continuity is accepted. A missing weekday, ambiguous holiday, overlap, fragment, delayed period, internal connectivity failure, or incomplete end breaks the chain. Without a complete exchange calendar, the optimizer treats holiday ambiguity as missing evidence rather than inventing continuity.
+Continuity is deliberately fail-closed. Both adjacent sessions must pass the primary quality gate, dates must be conservatively consecutive under the built-in weekday rule, and the closing session must contain a valid post-entry bid mark. Friday-to-Monday continuity is accepted. A missing weekday, ambiguous holiday, conflicting schedule, delayed period, internal connectivity failure, excessive stitched gap, or incomplete end breaks the chain. Without a complete exchange calendar, the optimizer treats holiday ambiguity as missing evidence rather than inventing continuity.
 
 Whole-day bootstrap units become complete overnight-continuity blocks when a position links several sessions. This avoids resampling economically dependent days independently. The resulting bootstrap remains in-sample and can still understate serial dependence across broader market regimes.
 
@@ -396,3 +396,73 @@ SQLite calibration produces separate BUY and SELL p50, p75, and p90 cost distrib
 The changed candidate must remain preferable under balanced, drawdown-focused, return-focused, and cost-stressed score policies; it must not be Pareto dominated; and any stable region touching a search boundary must be extended and resolved. Fixed candidate/control replay is also repeated under cost, quote-age, notional, entry-delay, and entry-cutoff stress.
 
 The final report emits a named pass/fail row for each authorization gate. Exactly one profile is always emitted. Any required gate that is unavailable or fails causes the unchanged control to be displayed for reference.
+
+## 29. Version 2.0 protective SELL policy comparison
+
+The independent Market Replay method now treats protective SELL behavior as a
+separate risk-policy layer before ATR optimization. It first evaluates the
+unchanged `14 x 60-second` ATR control under:
+
+```text
+protective SELL disabled
+manual native trailing SELL: 1%, 2%, 3%, 4%, 5%
+ATR-adaptive trailing SELL: 1.5x, 2.0x, 2.5x, 3.0x, 3.5x, 4.0x, 4.5x
+```
+
+Manual values are direct trailing percentages. ATR-adaptive values multiply the
+same reconstructed ATR percentage and use the candidate's minimum and maximum
+ATR clamps. The effective percentage is rounded to two percentage decimals, as
+in BouncyBot. At least three adjacent near-best values are required to form a
+supported policy region; an isolated policy maximum cannot advance. The
+region's deterministic median centre must also have at least three modeled
+protective exits across three dates, improve the disabled control by the
+practical score threshold, avoid material maximum-drawdown and worst-session
+deterioration, and remain identifiable rather than being at a clamp at least
+90% of its decisions.
+
+The disabled control and at most one enabled region centre proceed to the ATR
+search. Each policy performs Stage 1 bar-duration and Stage 2 ATR-period
+selection independently. Stage 3 searches ordinary strategy multipliers and
+minimum clamp only inside that policy's own selected windows. The complete
+changed ATR-plus-policy profile must still pass every standard authorization
+gate against the unchanged disabled control. Insufficient evidence therefore
+returns the unchanged control with protective SELL disabled rather than the
+numerically strongest stop policy.
+
+### Protective order replay
+
+After a modeled BUY, the protective percentage is locked. The pure stop is:
+
+```text
+average modeled BUY price x (1 - protective percentage)
+```
+
+The controller-compatible final initial stop uses the lower of that pure stop
+and the conservative visible SELL reference moved down by the same trail, then
+rounds down to the contract minimum tick. The running high and stop move only
+on a genuine Last update or complete snapshot. A quote-only event carrying a
+cached Last cannot trigger the order. When Last reaches or crosses the stop,
+the native trail is treated as a market-style SELL and remains pending until a
+fresh valid bid appears. The fill uses the worse of the Last trigger reference
+and the bid, then applies the configured or calibrated SELL execution reserve.
+
+A submitted or triggered protective order can cross a provably continuous RTH
+boundary. On the first genuine Last of the next recording, its prior locked
+percentage, running high, and stop still apply. A pending market-style SELL can
+also wait for the next valid bid. When the normal minimum-profit path becomes
+eligible, the protective order is cancelled and the normal SELL is submitted.
+The live bot waits for cancellation confirmation; Market Replay performs this
+as one atomic state transition because market recordings do not contain broker
+acknowledgements. This limitation is part of the search contract and report.
+
+### Protective policy diagnostics
+
+The policy comparison reports return, drawdown, costs, turnover, protective
+exits, and protective cancellations. Detailed stop-out evidence additionally
+observes executable bids until the next modeled BUY or end of the same verified
+continuity chain. It records whether price recovered to the original BUY,
+whether it reached the normal activation threshold calculated at the stop
+event, the additional decline avoided after the exit, recovery regret, and
+whether the exit occurred after an overnight hold. These values explain the
+risk trade-off but do not enter policy selection; the ordinary replay returns,
+costs, drawdown, censoring, and robustness gates remain the ranking evidence.

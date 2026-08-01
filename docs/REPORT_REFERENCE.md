@@ -117,7 +117,8 @@ The Market Replay HTML and JSON also distinguish `raw_row_count` from `retained_
 A Market Replay report now adds:
 
 - `input_recordings.csv`: canonical physical-component inventory, hashes, format/container details, and data ranges for every selected recording;
-- `excluded_sessions.csv`: complete trading dates excluded because overlap, fragmentation, or missing retained evidence prevented a provably continuous session;
+- `recording_fragment_evidence.csv`: one row per same-date source period, including whether it was retained, stitched, dropped because of overlap/no rows, or excluded for schedule conflict;
+- `excluded_sessions.csv`: complete trading dates excluded because no safe merged period could be constructed, including conflicting RTH schedules or missing retained evidence;
 - paired-day, trade-participation, drawdown-tail, unmarked-position, and ATR-phase fields in recommendation and candidate tables.
 
 `recording_count` is the number of selected main recording components. `raw_row_count` includes every validated row across inputs; `retained_row_count` is the strategy-relevant stream for included dates. A changed recommendation must have zero paired right-censored outcomes and zero unmarked open positions. The report's single profile is therefore either a changed profile that passed every authorization gate or the unchanged control accompanied by the failed-gate reasons.
@@ -154,3 +155,31 @@ The Market Replay report adds these deterministic files:
 | `recommendation_quality_gates.csv` | Canonical required/optional pass/fail decomposition used to authorize or reject the changed profile |
 
 The HTML report derives the displayed balanced score formula from the serialized score-policy contract. `evidence_stable=true` requires every required gate in `recommendation_quality_gates.csv` to pass. Missing walk-forward or selection-aware evidence is a failed authorization gate, not an implicit pass.
+
+## Version 2.0 protective SELL policy evidence
+
+The Market Replay report now describes one complete ATR and protective-SELL
+policy profile. Two additional deterministic files are written:
+
+| File | Meaning |
+|---|---|
+| `protective_sell_policy_comparison.csv` | Disabled, manual, and ATR-adaptive policy-screen candidates at the unchanged ATR control, including score delta, return, drawdown, completed/protective exits, cancellations, stable-region identity, selection/eligibility, clamp evidence, descriptive recovery metrics, and the decision reason. |
+| `protective_sell_trade_diagnostics.csv` | Protective exits belonging to the final detailed recommended replay, including BUY/SELL timestamps and prices, effective policy, initial stop, Last trigger, normal-activation threshold, recovery/avoided-loss/regret evidence, overnight holding count, and observation boundary. |
+
+`recommended_atr_settings.csv` remains a one-row file but now also contains
+`protective_sell_mode`, `protective_sell_value`, the human-readable policy
+label, enabled/adaptive flags, protective exit/cancellation counts, and the
+protective-policy stability gate. Candidate, session, continuity, trade, HTML,
+and JSON evidence contain the equivalent fields.
+
+The policy comparison is performed before the ordinary ATR search. An enabled
+policy may be marked `selected_policy` and `selected_for_atr_search` only when
+it is the supported adjacent-region centre. This is not the final trading
+recommendation: the later complete ATR-plus-policy profile must pass every
+recommendation gate. If no changed profile passes, the recommendation row is
+the unchanged `14 x 60-second` ATR control with `protective_sell_mode=disabled`.
+
+Recovery and avoided-loss fields are descriptive hindsight diagnostics. They
+are deliberately excluded from the candidate score and recommendation gates.
+A blank value means the verified continuity chain did not provide the required
+future executable bid evidence.

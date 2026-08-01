@@ -87,6 +87,7 @@ class MarketReplayConfig:
     calibration_min_samples: int = 5
     calibration_use_execution_cost: bool = True
     calibration_use_trade_notional: bool = True
+    protective_policy_search_enabled: bool = True
 
     @property
     def recording_paths(self) -> tuple[Path, ...]:
@@ -403,6 +404,10 @@ class MarketReplayConfig:
                 self.calibration_use_trade_notional,
                 name="calibration_use_trade_notional",
             ),
+            protective_policy_search_enabled=_strict_bool(
+                self.protective_policy_search_enabled,
+                name="protective_policy_search_enabled",
+            ),
         )
 
 
@@ -520,6 +525,9 @@ class IbrecPeriod:
     close_reason: str
     tick_count: int
     source_recording_sha256: str = ""
+    # Chronological content fingerprints of every recording that contributed a
+    # stitched fragment to this period; one entry for a single-source period.
+    source_recording_sha256s: tuple[str, ...] = ()
     primary_eligible: bool = True
     source_finalized: bool = True
     coverage_pct: float = 100.0
@@ -553,6 +561,7 @@ class IbrecRecording:
     data_end_utc: str
     excluded_sessions: list[dict[str, Any]] = field(default_factory=list)
     quality_events: list[dict[str, Any]] = field(default_factory=list)
+    fragment_evidence: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def symbol(self) -> str:
@@ -628,17 +637,81 @@ class AtrProfile:
     sell_trail_multiplier: float
     min_atr_pct: float = 0.10
     max_atr_pct: float = 20.00
+    protective_sell_mode: str = "disabled"
+    protective_sell_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        mode = str(self.protective_sell_mode or "disabled").strip().lower()
+        if mode not in {"disabled", "manual", "atr"}:
+            raise ValueError(
+                "protective_sell_mode must be 'disabled', 'manual', or 'atr'."
+            )
+        value = finite_float(self.protective_sell_value)
+        if value is None:
+            raise ValueError("protective_sell_value must be finite.")
+        if mode == "disabled":
+            value = 0.0
+        elif mode == "manual":
+            if value < 0.01 or value > 99.99:
+                raise ValueError(
+                    "Manual protective SELL trail must be between 0.01% and 99.99%."
+                )
+        elif value < 0.01 or value > 50.0:
+            raise ValueError(
+                "ATR-adaptive protective SELL multiplier must be between 0.01 and 50."
+            )
+        object.__setattr__(self, "protective_sell_mode", mode)
+        object.__setattr__(self, "protective_sell_value", round(value, 4))
+
+    @property
+    def protective_sell_enabled(self) -> bool:
+        return self.protective_sell_mode != "disabled"
+
+    @property
+    def protective_sell_atr_adaptive(self) -> bool:
+        return self.protective_sell_mode == "atr"
+
+    @property
+    def protective_policy_label(self) -> str:
+        if self.protective_sell_mode == "manual":
+            return f"Manual {self.protective_sell_value:.2f}% trail"
+        if self.protective_sell_mode == "atr":
+            return f"ATR-adaptive {self.protective_sell_value:.2f}x trail"
+        return "Disabled"
 
     def key(self) -> str:
+        protective = (
+            "protective-off"
+            if self.protective_sell_mode == "disabled"
+            else f"protective-{self.protective_sell_mode}{self.protective_sell_value:.2f}"
+        )
         return (
             f"p{self.period}-b{self.bar_seconds}-d{self.initial_drop_multiplier:.2f}"
             f"-buy{self.buy_rebound_multiplier:.2f}-profit{self.minimum_profit_multiplier:.2f}"
             f"-sell{self.sell_trail_multiplier:.2f}-min{self.min_atr_pct:.2f}"
-            f"-max{self.max_atr_pct:.2f}"
+            f"-max{self.max_atr_pct:.2f}-{protective}"
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value.update(
+            {
+                "protective_sell_enabled": self.protective_sell_enabled,
+                "protective_sell_atr_adaptive": self.protective_sell_atr_adaptive,
+                "protective_sell_trailing_stop_pct": (
+                    self.protective_sell_value
+                    if self.protective_sell_mode == "manual"
+                    else None
+                ),
+                "atr_protective_sell_multiplier": (
+                    self.protective_sell_value
+                    if self.protective_sell_mode == "atr"
+                    else None
+                ),
+                "protective_policy_label": self.protective_policy_label,
+            }
+        )
+        return value
 
 
 @dataclass(slots=True)
@@ -663,6 +736,19 @@ class MarketReplayTrade:
     net_return_bps: float | None = None
     sell_session_date: str = ""
     overnight_sessions_held: int = 0
+    continuity_chain_id: int = 0
+    exit_type: str = ""
+    protective_sell_mode: str = "disabled"
+    protective_sell_value: float = 0.0
+    protective_sell_pct: float | None = None
+    protective_initial_stop_price: float | None = None
+    protective_trigger_price: float | None = None
+    normal_activation_price_at_protective_exit: float | None = None
+    protective_recovered_to_buy: bool | None = None
+    protective_reached_normal_activation: bool | None = None
+    protective_loss_avoided_bps: float | None = None
+    protective_regret_bps: float | None = None
+    protective_observation_end_utc: str = ""
 
 
 @dataclass(slots=True)
@@ -729,6 +815,11 @@ class MarketReplaySessionResult:
     session_end_equity: float = 1.0
     cumulative_end_equity: float = 1.0
     overnight_gap_return_bps: float | None = None
+    protective_exits: int = 0
+    protective_cancellations: int = 0
+    protective_trigger_pending_at_end: bool = False
+    carried_protective_trail_in: bool = False
+    carried_protective_trail_out: bool = False
 
 
 @dataclass(slots=True)
@@ -834,6 +925,10 @@ class MarketReplayCandidateSummary:
     assumption_stress_results: list[dict[str, Any]] = field(default_factory=list)
     assumption_stress_all_positive: bool = False
     recommendation_gates: list[dict[str, Any]] = field(default_factory=list)
+    protective_exits: int = 0
+    protective_cancellations: int = 0
+    protective_exit_rate_pct: float = 0.0
+    protective_policy_stable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -872,6 +967,7 @@ class MarketReplayAnalysisResult:
     boundary_evidence: list[dict[str, Any]] = field(default_factory=list)
     assumption_stress_evidence: list[dict[str, Any]] = field(default_factory=list)
     recommendation_gates: list[dict[str, Any]] = field(default_factory=list)
+    protective_policy_evidence: list[dict[str, Any]] = field(default_factory=list)
     exploratory_only: bool = False
     files_written: list[Path] = field(default_factory=list)
 
@@ -903,6 +999,7 @@ class MarketReplayAnalysisResult:
                 "data_end_utc": self.recording.data_end_utc,
                 "issues": self.recording.issues,
                 "excluded_sessions": self.recording.excluded_sessions,
+                "fragment_evidence": self.recording.fragment_evidence,
             },
             "recommendation": self.recommendation.to_dict(),
             "recommendation_reason": self.recommendation_reason,
@@ -928,6 +1025,7 @@ class MarketReplayAnalysisResult:
             "boundary_evidence": self.boundary_evidence,
             "assumption_stress_evidence": self.assumption_stress_evidence,
             "recommendation_gates": self.recommendation_gates,
+            "protective_policy_evidence": self.protective_policy_evidence,
             "exploratory_only": self.exploratory_only,
             "files_written": [
                 path.relative_to(self.output_dir).as_posix()

@@ -16,7 +16,7 @@ def test_cli_version(capsys) -> None:
         main(["--version"])
     except SystemExit as exc:
         assert exc.code == 0
-    assert "1.9.3" in capsys.readouterr().out
+    assert "2.0.1" in capsys.readouterr().out
 
 
 def test_packaged_smoke_test_imports_gui_without_starting_it(monkeypatch) -> None:

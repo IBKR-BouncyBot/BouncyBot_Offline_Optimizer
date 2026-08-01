@@ -123,13 +123,14 @@ def _candidate(profile: AtrProfile, *, score: float, return_bps: float = 10.0) -
     )
 
 
-def test_analysis_contract_is_v13_and_single_sources_score_policies(tmp_path: Path) -> None:
+def test_analysis_contract_is_v15_and_single_sources_score_policies(tmp_path: Path) -> None:
     contract = market_replay_search_contract(
         MarketReplayConfig(tmp_path / "sample.ibrec", tmp_path / "reports")
     )
-    assert MARKET_REPLAY_ANALYSIS_CONTRACT_VERSION == 13
-    assert contract["contract_version"] == 13
+    assert MARKET_REPLAY_ANALYSIS_CONTRACT_VERSION == 15
+    assert contract["contract_version"] == 15
     assert contract["score_policies"] == score_policy_contract()
+    assert contract["protective_sell_policy_search"]["disabled_control"] is True
     assert any(
         "selection-aware out-of-bag bootstrap" in item
         for item in contract["changed_recommendation_requires"]

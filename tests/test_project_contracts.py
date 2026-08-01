@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_is_consistent_across_release_files() -> None:
-    assert APP_VERSION == "1.9.3"
+    assert APP_VERSION == "2.0.1"
     assert APP_NAME == "BouncyBot Offline Optimizer"
     for relative in [
         "pyproject.toml",
@@ -25,7 +25,7 @@ def test_version_is_consistent_across_release_files() -> None:
         "scripts/build_windows.ps1",
         "scripts/windows_version_info.txt",
         "docs/README.md",
-        "docs/V1_9_3_CALIBRATION_DATE_KEY_AND_REPORT_INTEGRITY.md",
+        "docs/V2_0_1_RUFF_F841_QUALITY_GATE_CORRECTION.md",
     ]:
         assert APP_VERSION in (ROOT / relative).read_text(encoding="utf-8-sig")
 
@@ -89,11 +89,20 @@ def test_version_is_consistent_across_release_files() -> None:
     assert "v1.9.2" in (
         ROOT / "docs/V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md"
     ).read_text(encoding="utf-8-sig")
+    assert "v1.9.3" in (
+        ROOT / "docs/V1_9_3_CALIBRATION_DATE_KEY_AND_REPORT_INTEGRITY.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v1.9.4" in (
+        ROOT / "docs/V1_9_4_SAME_DATE_FRAGMENT_MERGING_AND_DIAGNOSTICS.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.0.0" in (
+        ROOT / "docs/V2_0_0_PROTECTIVE_SELL_POLICY_OPTIMIZATION.md"
+    ).read_text(encoding="utf-8-sig")
     windows_version = (ROOT / "scripts/windows_version_info.txt").read_text(
         encoding="utf-8-sig"
     )
-    assert "filevers=(1, 9, 3, 0)" in windows_version
-    assert "prodvers=(1, 9, 3, 0)" in windows_version
+    assert "filevers=(2, 0, 1, 0)" in windows_version
+    assert "prodvers=(2, 0, 1, 0)" in windows_version
 
 
 def test_v191_reported_f841_condition_remains_corrected() -> None:
@@ -134,7 +143,7 @@ def test_v140_market_replay_contract_supports_v2_and_v3(tmp_path: Path) -> None:
     contract = market_replay_search_contract(
         MarketReplayConfig(tmp_path / "recording.ibrec", tmp_path / "reports")
     )
-    assert contract["contract_version"] == 13
+    assert contract["contract_version"] == 15
     assert contract["supported_ibrec_versions"] == [2, 3]
     assert contract["atr_window_search"]["stage_1"]["fixed_period"] == 14
     assert contract["atr_window_search"]["stage_2"]["periods"] == [5, 7, 10, 14, 21, 28]
@@ -144,7 +153,7 @@ def test_v140_market_replay_contract_supports_v2_and_v3(tmp_path: Path) -> None:
     assert "synthetic source" in contract["evidence_stability_gates"]
     assert contract["input_recordings"]["maximum"] == 64
     assert contract["input_recordings"]["same_day_overlap_policy"].startswith(
-        "exclude the complete trading date"
+        "stitch the deterministic coverage-first"
     )
     assert "5-second phase offsets" in contract["atr_clock"]
     assert "recorded non-crossed ask" in contract["fill_model"]
@@ -170,6 +179,25 @@ def test_v140_market_replay_contract_supports_v2_and_v3(tmp_path: Path) -> None:
     assert calibration["enabled"] is False
     assert calibration["maximum_quote_age_seconds"] == 5.0
     assert calibration["minimum_samples"] == 5
+    protective = contract["protective_sell_policy_search"]
+    assert protective["enabled"] is True
+    assert protective["disabled_control"] is True
+    assert protective["manual_trailing_percentages"] == [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert protective["atr_adaptive_multipliers"] == [
+        1.5,
+        2.0,
+        2.5,
+        3.0,
+        3.5,
+        4.0,
+        4.5,
+    ]
+    assert protective["maximum_policies_advanced"] == 2
+    assert "cancel" in protective["normal_sell_replacement"].lower()
+    assert any(
+        "protective SELL policy" in requirement
+        for requirement in contract["changed_recommendation_requires"]
+    )
 
 
 def test_gui_contains_lock_check_and_explicit_confirmation() -> None:

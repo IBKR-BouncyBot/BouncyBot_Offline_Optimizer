@@ -116,7 +116,7 @@ Format 2 and format 3 both preserve `changed_fields`. Positive native trails are
 
 ## Multiple Market Replay recordings
 
-Several recordings improve independent-day coverage only when they represent the same instrument and non-overlapping complete dates. The optimizer does not combine partial periods into one synthetic day. A date appearing more than once is excluded in full, including when the fragments might appear complementary, because continuity of ATR, anchor, native trail, and position state cannot be established from separate files.
+Several recordings improve independent-day coverage only when they represent the same instrument. Verified same-date fragments with compatible scheduled RTH boundaries can now be stitched into one period. The deterministic selector maximizes wall-clock coverage, then prefers live-only and normal-close evidence before callback density, preserves the actual outage between fragments in the merged monotonic clock, and never interleaves overlapping streams. This does not make a gap disappear: excessive event gaps, sparse Last evidence, incomplete boundaries, mixed feeds, connectivity loss, or other quality failures still prevent the date from authorizing a changed recommendation. Conflicting schedules exclude the date.
 
 Millions of events across five dates still provide roughly five independent day-level observations. Whole-day bootstrap, leave-one-day-out, stable regions, tail checks, and ATR phase stress are used to reject fragile changes; they cannot create new regimes or make an in-sample result out-of-sample. Any incomplete paired outcome blocks a changed recommendation in v1.6. Later unseen recordings and forward paper trading remain required.
 
