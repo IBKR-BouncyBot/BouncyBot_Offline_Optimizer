@@ -63,7 +63,7 @@ Reports can contain exact timestamps, prices, quantities, order references, P/L,
 
 ## Market Replay operation
 
-Open **Market Replay (.ibrec v2/v3)**, add one or more recordings for the same instrument, and select a report output root. **Check recordings** performs bounded structural preflight and aggregate-limit checks. **Analyze recordings** performs the full private-copy and integrity verification, excludes ambiguous overlapping dates, runs the bounded three-stage search plus robustness analysis, and writes the deterministic report.
+Open **Market Replay (.ibrec v2/v3)**, add one or more recordings for the same instrument, and select a report output root. **Check recordings** performs bounded structural preflight and aggregate-limit checks. **Analyze recordings** performs the full private-copy and integrity verification, stitches compatible non-overlapping same-date fragments while preserving their outages, compares protective SELL disabled with bounded manual and ATR-adaptive policies, runs the three-stage ATR search separately for the supported policies, applies the complete robustness authorization stack, and writes the deterministic report.
 
 The preflight shows lifecycle status for every selected recording and flags synthetic provenance. Full hash-chain/checkpoint verification occurs during analysis. Prefer closed, committed recordings. A format-3 file with an active period is accepted as interrupted recovery evidence, but the affected session remains right-censored. Do not analyze a file while Market Replay Lab is actively writing it; source or rollback-journal mutation causes the run to abort.
 
@@ -73,7 +73,7 @@ Without optional calibration, this workflow does not require BouncyBot to be clo
 
 When **Optional execution calibration** is selected, close BouncyBot first. The optimizer validates the selected folder, requires its normal lock to be absent, and asks for explicit confirmation. It then acquires the same lock only while it fingerprints and privately snapshots `bot_state.sqlite` and any SQLite sidecars. `debug_captures` is not required or read. The lock is released before the Market Replay search. Absolute calibration paths are excluded from the report and deterministic analysis identity.
 
-The **Overnight replay** option is enabled by default. It can carry an open long, active SELL trail, or triggered SELL waiting for a bid only across consecutive primary-eligible recordings. Missing weekdays, ambiguous holidays, overlapping dates, partial/failed-quality sessions, or the absence of a closing bid mark break continuity and terminalize the unresolved position. A HOLD state re-warms ATR in the next session; a SELL trail that was already submitted retains its locked trail state.
+The **Overnight replay** option is enabled by default. It can carry an open long, active normal or protective SELL trail, or a triggered SELL waiting for a bid only across consecutive primary-eligible recordings. Missing weekdays, ambiguous holidays, schedule conflicts, partial/failed-quality sessions, excessive stitched gaps, or the absence of a closing bid mark break continuity and terminalize the unresolved position. A HOLD state re-warms ATR in the next session; a normal or protective SELL trail that was already submitted retains its locked trail state. The Market Replay report models protective cancellation and normal-SELL replacement atomically because `.ibrec` does not record broker cancellation acknowledgements; forward paper testing remains required.
 
 Terminal example:
 
@@ -88,7 +88,7 @@ BouncyBotOfflineOptimizer.exe --no-gui --ibrec `
 
 Keep every recording immutable while analysis is running. The run aborts when any source component or active rollback journal changes. Version-3 recordings may be accompanied by `-journal`; the journal is treated as part of the corresponding input identity. Symlink inputs are rejected.
 
-Each recording should begin early enough for ATR warm-up and continue through the standardized entry cutoff or through all open simulated positions. Short, interrupted, or manually stopped recordings remain reportable but produce right-censored outcomes and unstable evidence. Do not select two files for the same trading date unless the complete-date exclusion is intentional; the optimizer will not join same-day fragments.
+Each recording should begin early enough for ATR warm-up and continue through the standardized entry cutoff or through all open simulated positions. Short, interrupted, or manually stopped recordings remain reportable but produce right-censored outcomes and unstable evidence. Selecting complementary files for one date is supported when their RTH schedules agree and their retained tick ranges do not overlap. Review `recording_fragment_evidence.csv`: real outages are preserved and may still disqualify the date; overlapping streams are never interleaved.
 
 
 ## Reproducible Windows release build

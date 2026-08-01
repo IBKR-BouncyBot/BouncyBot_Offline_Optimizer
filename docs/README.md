@@ -1,4 +1,4 @@
-# Documentation index — BouncyBot Offline Optimizer v1.9.3
+# Documentation index — BouncyBot Offline Optimizer v2.0.1
 
 - [Architecture](ARCHITECTURE.md)
 - [Operations and portable placement](OPERATIONS.md)
@@ -7,6 +7,9 @@
 - [Report reference](REPORT_REFERENCE.md)
 - [Database compatibility](DATABASE_COMPATIBILITY.md)
 - [Testing](TESTING.md)
+- [v2.0.1 Ruff F841 quality-gate correction](V2_0_1_RUFF_F841_QUALITY_GATE_CORRECTION.md)
+- [v2.0.0 protective SELL policy optimization](V2_0_0_PROTECTIVE_SELL_POLICY_OPTIMIZATION.md)
+- [v1.9.4 same-date fragment merging and diagnostics](V1_9_4_SAME_DATE_FRAGMENT_MERGING_AND_DIAGNOSTICS.md)
 - [v1.9.3 calibration date-key correction and report integrity](V1_9_3_CALIBRATION_DATE_KEY_AND_REPORT_INTEGRITY.md)
 - [v1.9.2 Market Replay preflight and Windows test clarification](V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md)
 - [v1.9.1 Ruff F841 quality-gate correction](V1_9_1_RUFF_F841_QUALITY_GATE_CORRECTION.md)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -321,8 +323,9 @@ def test_report_contains_explanations_and_all_evidence_files(tmp_path: Path) -> 
         "index.html",
         "market_replay_analysis.json",
         "input_recordings.csv",
+        "recording_fragment_evidence.csv",
         "excluded_sessions.csv",
-            "session_quality.csv",
+        "session_quality.csv",
         "atr_window_search.csv",
         "candidate_results.csv",
         "robustness_evidence.csv",
@@ -342,6 +345,8 @@ def test_report_contains_explanations_and_all_evidence_files(tmp_path: Path) -> 
         "search_boundary_evidence.csv",
         "assumption_stress_evidence.csv",
         "recommendation_quality_gates.csv",
+        "protective_sell_policy_comparison.csv",
+        "protective_sell_trade_diagnostics.csv",
         "data_quality_issues.csv",
         "README_REPORT.txt",
         "analysis_manifest.json",
@@ -349,7 +354,7 @@ def test_report_contains_explanations_and_all_evidence_files(tmp_path: Path) -> 
     }
     assert {path.name for path in result.files_written} == expected
     text = (result.output_dir / "index.html").read_text(encoding="utf-8")
-    assert "One complete ATR profile to evaluate" in text
+    assert "One complete ATR and protective-SELL profile to evaluate" in text
     assert "Format version 2" in text or "format version" in text.lower()
     assert "right-censored" in text
     assert "not a mathematical optimum" in text
@@ -361,6 +366,34 @@ def test_report_contains_explanations_and_all_evidence_files(tmp_path: Path) -> 
     assert "leave-one-day-out" in text.lower()
     assert "selection-aware bootstrap" in text.lower()
     assert "chronological walk-forward" in text.lower()
+    assert "protective sell policy comparison" in text.lower()
+    assert "atomic cancel-and-replace" in text.lower()
+
+    analysis = json.loads(
+        (result.output_dir / "market_replay_analysis.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    profile = analysis["recommendation"]["profile"]
+    assert profile["protective_sell_mode"] in {"disabled", "manual", "atr"}
+    assert "protective_sell_value" in profile
+    assert isinstance(analysis["protective_policy_evidence"], list)
+
+    with (result.output_dir / "protective_sell_policy_comparison.csv").open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows
+    assert {
+        "mode",
+        "value",
+        "score_delta_vs_disabled",
+        "stable_region_center",
+        "selected_policy",
+        "selected_for_atr_search",
+        "decision",
+    }.issubset(rows[0])
 
 
 def test_report_refuses_to_replace_different_content_at_same_analysis_id(

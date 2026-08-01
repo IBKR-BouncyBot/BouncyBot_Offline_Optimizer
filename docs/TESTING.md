@@ -122,7 +122,7 @@ Version 1.5.3 adds cross-platform tests for deterministic executable metadata an
 
 ## v1.6 multi-recording and recommendation-soundness tests
 
-Version 1.6 adds regression coverage for immutable multi-path configuration, duplicate path/content rejection, same-instrument validation, aggregate row/byte limits, deterministic input-order independence, strict same-date overlap exclusion, multi-file report determinism, monotonic ATR timing, stale-gap warm-up reset, five-second phase stress, same-side touch fills, immediate spread drawdown, stale pre-entry bid rejection, unmarked open positions, right-censor authorization failure, refinement-window distribution, complete report inventories, and path-independent component fingerprints.
+Version 1.6 adds regression coverage for immutable multi-path configuration, duplicate path/content rejection, same-instrument validation, aggregate row/byte limits, deterministic input-order independence, multi-file report determinism, monotonic ATR timing, stale-gap warm-up reset, five-second phase stress, same-side touch fills, immediate spread drawdown, stale pre-entry bid rejection, unmarked open positions, right-censor authorization failure, refinement-window distribution, complete report inventories, and path-independent component fingerprints. Version 1.9.4 replaces complete-date overlap exclusion with coverage-first same-date fragment selection and adds tests for deterministic stitching, preserved gaps, sparse-complete versus dense-partial selection, schedule conflicts, complete multi-source provenance, fragment CSV/HTML/JSON evidence, filename-specific failures, and input-order independence.
 
 The complete release gate still promotes `ResourceWarning` to an error, enforces branch-aware coverage, compiles all Python files, and requires Ruff and Pyright on Windows. The portable build remains a two-pass byte-comparison PyInstaller build using the exact release lock.
 
@@ -162,3 +162,26 @@ The v1.9 tests additionally cover:
 - deterministic reports containing every new evidence CSV.
 
 The Linux release gate may execute the suite in disjoint processes when the host's third-party pytest instrumentation does not terminate cleanly after a large combined run. Every collected test file must still be included exactly once, `ResourceWarning` remains fatal, and coverage is accumulated across the disjoint processes before the 85% branch-aware gate is evaluated. The authoritative Windows gate remains `run_all_tests.bat` followed by the reproducible PyInstaller build.
+
+## v2.0 protective SELL policy tests
+
+Version 2.0 adds focused coverage for:
+
+- protective profile validation, stable content keys, and JSON/report fields;
+- manual and ATR-adaptive effective percentages and clamp accounting;
+- BouncyBot-compatible initial protective-stop normalization and minimum-tick rounding;
+- genuine-Last native trail movement and rejection of quote-only cached Last triggers;
+- market-style protective exits waiting for a fresh bid;
+- normal minimum-profit SELL replacement cancelling the protective order;
+- active and already-triggered protective orders crossing a verified overnight boundary;
+- ATR re-warm behavior and descriptive normal-activation thresholds after an overnight HOLD;
+- stop-out recovery, later normal activation, avoided-loss, regret, and bounded observation evidence;
+- adjacent protective-policy region construction and deterministic centre selection;
+- rejection of isolated stop-policy winners, insufficient exits/days, tail deterioration, and clamp-bound ATR policies;
+- strict separation of policy-specific Stage 1/2 ATR windows in Stage 3;
+- separate refinement-seed allocation and stable-region adjacency across policies;
+- conservative fallback to the disabled unchanged control;
+- deterministic HTML, JSON, CSV, report-manifest, and analysis-identity output.
+
+The final native Windows gate remains responsible for Ruff, Pyright, PySide6
+thread/UI behavior, and the reproducible two-pass PyInstaller executable build.

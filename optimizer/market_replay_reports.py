@@ -42,6 +42,7 @@ _FILE_NAMES = (
     "index.html",
     "market_replay_analysis.json",
     "input_recordings.csv",
+    "recording_fragment_evidence.csv",
     "excluded_sessions.csv",
     "session_quality.csv",
     "atr_window_search.csv",
@@ -63,6 +64,8 @@ _FILE_NAMES = (
     "search_boundary_evidence.csv",
     "assumption_stress_evidence.csv",
     "recommendation_quality_gates.csv",
+    "protective_sell_policy_comparison.csv",
+    "protective_sell_trade_diagnostics.csv",
     "data_quality_issues.csv",
     "README_REPORT.txt",
     "analysis_manifest.json",
@@ -74,6 +77,7 @@ _CLAMP_COMPONENTS = (
     "buy_rebound",
     "minimum_profit",
     "sell_trail",
+    "protective_sell",
 )
 
 
@@ -209,6 +213,11 @@ def _profile_row(result: MarketReplayAnalysisResult) -> dict[str, Any]:
         "atr_buy_rebound_multiplier": profile.buy_rebound_multiplier,
         "atr_minimum_profit_multiplier": profile.minimum_profit_multiplier,
         "atr_sell_trail_multiplier": profile.sell_trail_multiplier,
+        "protective_sell_mode": profile.protective_sell_mode,
+        "protective_sell_value": profile.protective_sell_value,
+        "protective_policy_label": profile.protective_policy_label,
+        "protective_sell_enabled": profile.protective_sell_enabled,
+        "protective_sell_atr_adaptive": profile.protective_sell_atr_adaptive,
         "atr_min_pct": profile.min_atr_pct,
         "atr_max_pct": profile.max_atr_pct,
         "screening_score": result.recommendation.score,
@@ -309,6 +318,10 @@ def _profile_row(result: MarketReplayAnalysisResult) -> dict[str, Any]:
         ),
         "minimum_clamp_rate_pct": result.recommendation.clamp_min_rate_pct,
         "maximum_clamp_rate_pct": result.recommendation.clamp_max_rate_pct,
+        "protective_exits": result.recommendation.protective_exits,
+        "protective_cancellations": result.recommendation.protective_cancellations,
+        "protective_exit_rate_pct": result.recommendation.protective_exit_rate_pct,
+        "protective_policy_stable": result.recommendation.protective_policy_stable,
         **_flatten_clamp_rates(result.recommendation),
         "primary_eligible_sessions": result.recommendation.primary_eligible_sessions,
         "excluded_quality_sessions": result.recommendation.excluded_quality_sessions,
@@ -396,6 +409,9 @@ def _cards(result: MarketReplayAnalysisResult) -> str:
         ("Exploratory only", "Yes" if result.exploratory_only else "No"),
         ("Candidates", f"{len(result.candidates):,}"),
         ("Recommended score", f"{recommendation.score:.2f}"),
+        ("Protective SELL policy", recommendation.profile.protective_policy_label),
+        ("Protective exits", recommendation.protective_exits),
+        ("Protective cancellations", recommendation.protective_cancellations),
         ("Stable evidence", "Yes" if recommendation.evidence_stable else "No"),
         ("Synthetic source", "Yes" if rec.is_synthetic else "No"),
         ("Completed simulated trades", recommendation.completed_trades),
@@ -482,6 +498,9 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("atr_buy_rebound_multiplier", "BUY rebound × ATR"),
             ("atr_minimum_profit_multiplier", "Minimum profit × ATR"),
             ("atr_sell_trail_multiplier", "SELL trail × ATR"),
+            ("protective_policy_label", "Protective SELL policy"),
+            ("protective_sell_mode", "Protective mode"),
+            ("protective_sell_value", "Protective value"),
             ("atr_min_pct", "Minimum clamp %"),
             ("atr_max_pct", "Maximum clamp %"),
             ("screening_score", "Screening score"),
@@ -516,6 +535,11 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("buy_rebound_min_clamp_rate_pct", "BUY-rebound min-clamp %"),
             ("minimum_profit_min_clamp_rate_pct", "Minimum-profit min-clamp %"),
             ("sell_trail_min_clamp_rate_pct", "SELL-trail min-clamp %"),
+            ("protective_sell_min_clamp_rate_pct", "Protective min-clamp %"),
+            ("protective_exits", "Protective exits"),
+            ("protective_cancellations", "Protective cancellations"),
+            ("protective_exit_rate_pct", "Protective exit rate %"),
+            ("protective_policy_stable", "Protective policy stable"),
             ("exploratory_only", "Exploratory only"),
         ],
         empty="No recommendation was generated.",
@@ -532,6 +556,9 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("carried_position_out", "Position carried out"),
             ("carried_sell_trail_in", "SELL trail carried in"),
             ("carried_sell_trail_out", "SELL trail carried out"),
+            ("carried_protective_trail_in", "Protective trail carried in"),
+            ("carried_protective_trail_out", "Protective trail carried out"),
+            ("protective_trigger_pending_at_end", "Protective fill pending"),
             ("terminal_open_position", "Terminal open position"),
             ("ticks", "Ticks"),
             ("trades", "Trades"),
@@ -562,6 +589,9 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("buy_rebound_min_clamp_rate_pct", "BUY min-clamp %"),
             ("minimum_profit_min_clamp_rate_pct", "Profit min-clamp %"),
             ("sell_trail_min_clamp_rate_pct", "SELL min-clamp %"),
+            ("protective_sell_min_clamp_rate_pct", "Protective min-clamp %"),
+            ("protective_exits", "Protective exits"),
+            ("protective_cancellations", "Protective cancellations"),
             ("issues", "Issues"),
         ],
         empty="No analyzable sessions were available.",
@@ -578,6 +608,7 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("buy_rebound_multiplier", "BUY ×"),
             ("minimum_profit_multiplier", "Profit ×"),
             ("sell_trail_multiplier", "SELL ×"),
+            ("protective_policy_label", "Protective policy"),
             ("min_atr_pct", "Minimum clamp %"),
             ("score", "Score"),
             ("completed_trades", "Completed trades"),
@@ -594,6 +625,9 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("buy_rebound_min_clamp_rate_pct", "BUY min-clamp %"),
             ("minimum_profit_min_clamp_rate_pct", "Profit min-clamp %"),
             ("sell_trail_min_clamp_rate_pct", "SELL min-clamp %"),
+            ("protective_sell_min_clamp_rate_pct", "Protective min-clamp %"),
+            ("protective_exits", "Protective exits"),
+            ("protective_exit_rate_pct", "Protective exit rate %"),
             ("open_position_rate_pct", "Open %"),
             ("right_censored_rate_pct", "Right-censored %"),
             ("unmarked_open_position_rate_pct", "Unmarked open %"),
@@ -631,6 +665,7 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("completed_trades", "Completed trades"),
             ("right_censored_rate_pct", "Right-censored %"),
             ("selection_basis", "Selection basis"),
+            ("window_search_policy", "Protective policy"),
         ],
         empty="No ATR-window search evidence was generated.",
     )
@@ -731,12 +766,86 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("carried_position_out", "Position out"),
             ("carried_sell_trail_in", "SELL trail in"),
             ("carried_sell_trail_out", "SELL trail out"),
+            ("carried_protective_trail_in", "Protective trail in"),
+            ("carried_protective_trail_out", "Protective trail out"),
+            ("protective_trigger_pending_at_end", "Protective fill pending"),
             ("terminal_open_position", "Terminal open"),
             ("session_start_equity", "Start equity"),
             ("session_end_equity", "End equity"),
             ("overnight_gap_return_bps", "Overnight gap bps"),
         ],
         empty="No continuity evidence was generated.",
+    )
+    protective_policy_table = _table(
+        result.protective_policy_evidence,
+        [
+            ("label", "Policy"),
+            ("score", "Screening score"),
+            ("score_delta_vs_disabled", "Delta vs disabled"),
+            ("median_return_bps", "Median return bps"),
+            ("worst_return_bps", "Worst return bps"),
+            ("maximum_drawdown_bps", "Maximum drawdown bps"),
+            ("completed_trades", "Completed trades"),
+            ("protective_exits", "Protective exits"),
+            ("protective_cancellations", "Cancelled for normal SELL"),
+            ("protective_exit_rate_pct", "Protective exit rate %"),
+            ("stable_region_id", "Policy region"),
+            ("stable_region_size", "Region size"),
+            ("stable_region_center", "Region center"),
+            ("eligible", "Eligible"),
+            ("selected_policy", "Selected policy"),
+            ("selected_for_atr_search", "Advanced to ATR search"),
+            ("recovery_observed_exits", "Recovery-observed exits"),
+            ("recovered_to_buy_count", "Recovered to BUY"),
+            ("recovered_to_buy_pct", "Recovered to BUY %"),
+            (
+                "normal_activation_observed_exits",
+                "Normal-activation-observed exits",
+            ),
+            (
+                "later_reached_normal_activation_count",
+                "Later reached normal activation",
+            ),
+            (
+                "later_reached_normal_activation_pct",
+                "Later reached normal activation %",
+            ),
+            ("median_further_loss_avoided_bps", "Median further loss avoided bps"),
+            ("median_recovery_regret_bps", "Median recovery regret bps"),
+            ("overnight_protective_exits", "Overnight protective exits"),
+            ("decision", "Decision"),
+        ],
+        empty="No protective SELL policy comparison was generated.",
+    )
+    protective_trade_rows = [
+        asdict(item)
+        for item in result.recommended_trades
+        if item.exit_type == "protective"
+    ]
+    protective_trade_table = _table(
+        protective_trade_rows,
+        [
+            ("session_date", "BUY session"),
+            ("sell_session_date", "Protective exit session"),
+            ("cycle_number", "Cycle"),
+            ("buy_price", "BUY price"),
+            ("sell_price", "Protective fill"),
+            ("protective_sell_mode", "Mode"),
+            ("protective_sell_value", "Configured value"),
+            ("protective_sell_pct", "Effective trail %"),
+            ("protective_initial_stop_price", "Initial stop"),
+            ("protective_trigger_price", "Trigger Last"),
+            ("return_bps", "Net return bps"),
+            ("protective_recovered_to_buy", "Later recovered to BUY"),
+            (
+                "protective_reached_normal_activation",
+                "Later reached normal activation",
+            ),
+            ("protective_loss_avoided_bps", "Further loss avoided bps"),
+            ("protective_regret_bps", "Recovery regret bps"),
+            ("protective_observation_end_utc", "Observation end"),
+        ],
+        empty="The recommended profile produced no protective exit.",
     )
     gate_table = _table(
         result.recommendation_gates,
@@ -793,6 +902,7 @@ def _html(result: MarketReplayAnalysisResult) -> str:
     excluded_session_table = _table(
         list(result.recording.excluded_sessions),
         [
+            ("reason_type", "Reason type"),
             ("session_date", "Trading date"),
             ("period_count", "RTH periods"),
             ("recording_hashes", "Recording hashes"),
@@ -800,11 +910,27 @@ def _html(result: MarketReplayAnalysisResult) -> str:
         ],
         empty="No trading dates were excluded.",
     )
+    fragment_evidence_table = _table(
+        list(result.recording.fragment_evidence),
+        [
+            ("session_date", "Trading date"),
+            ("status", "Decision"),
+            ("recording_sha256", "Recording hash"),
+            ("source_period_id", "Source period"),
+            ("merged_period_id", "Merged period"),
+            ("observed_start_utc", "Observed start"),
+            ("observed_end_utc", "Observed end"),
+            ("retained_rows", "Retained rows"),
+            ("reason", "Reason"),
+        ],
+        empty="No fragment-selection evidence was generated.",
+    )
     session_quality_table = _table(
         list(result.session_quality),
         [
             ("session_date", "Trading date"),
             ("period_id", "Period"),
+            ("source_recording_sha256s", "Contributing recordings"),
             ("manifest_status", "Manifest status"),
             ("source_finalized", "Completion proved"),
             ("coverage_pct", "RTH coverage %"),
@@ -831,6 +957,7 @@ def _html(result: MarketReplayAnalysisResult) -> str:
         for name, label in [
             ("market_replay_analysis.json", "Full JSON"),
             ("input_recordings.csv", "Input recordings"),
+            ("recording_fragment_evidence.csv", "Fragment decisions"),
             ("excluded_sessions.csv", "Excluded sessions"),
             ("session_quality.csv", "Session quality"),
             ("atr_window_search.csv", "ATR-window search"),
@@ -851,6 +978,8 @@ def _html(result: MarketReplayAnalysisResult) -> str:
             ("search_boundary_evidence.csv", "Search-boundary evidence"),
             ("assumption_stress_evidence.csv", "Assumption stress"),
             ("recommendation_quality_gates.csv", "Recommendation gates"),
+            ("protective_sell_policy_comparison.csv", "Protective SELL policies"),
+            ("protective_sell_trade_diagnostics.csv", "Protective exit diagnostics"),
             ("SHA256SUMS.txt", "Checksums"),
         ]
     )
@@ -861,20 +990,27 @@ def _html(result: MarketReplayAnalysisResult) -> str:
 <h1>{_escape(rec.symbol)} Market Replay ATR report</h1>
 <p class="muted">Generated by {_escape(APP_NAME)} {_escape(APP_VERSION)} from {_escape(rec.input_recording_count)} immutable Market Replay Lab recording(s). Analysis ID: <code>{_escape(result.analysis_id)}</code>.</p>
 <section>{_cards(result)}<p>{input_links}</p></section>
-<section class="{evidence_class}"><h2>One complete ATR profile to evaluate</h2>
+<section class="{evidence_class}"><h2>One complete ATR and protective-SELL profile to evaluate</h2>
 {profile_table}
 <p><strong>Why this profile:</strong> {_escape(result.recommendation_reason)}</p>
 <ul>{instability}</ul>
-<p>A changed profile is shown only when every required authorization gate passes: connected stable-region support, paired candidate/control evidence, whole-day and moving-block bootstrap, exact leave-one-day-out reselection, ATR phase stress, multiple score policies, Pareto non-domination, resolved search boundaries, assumption stress, economic continuity-block evidence, selection-aware out-of-bag bootstrap, and chronological walk-forward validation. When evidence is insufficient or unstable, the unchanged control is displayed <strong>for reference</strong>. An unchanged result means that no data-supported ATR change was found; it does not prove the control optimal. This is not a mathematical optimum, a forecast, or a live-trading instruction. Evaluate it in forward paper trading.</p></section>
+<p>A changed profile is shown only when every required authorization gate passes: the independent protective-policy screen, connected stable-region support, paired candidate/control evidence, whole-day and moving-block bootstrap, exact leave-one-day-out reselection, ATR phase stress, multiple score policies, Pareto non-domination, resolved search boundaries, assumption stress, economic continuity-block evidence, selection-aware out-of-bag bootstrap, and chronological walk-forward validation. When evidence is insufficient or unstable, the unchanged ATR control with protective SELL disabled is displayed <strong>for reference</strong>. An unchanged result means that no data-supported ATR or protective-policy change was found; it does not prove the control optimal. This is not a mathematical optimum, a forecast, or a live-trading instruction. Evaluate it in forward paper trading.</p></section>
 <section><h2>Optional calibration from actual BouncyBot executions</h2>
 <p>When a stopped BouncyBot data folder is selected, the optimizer acquires the normal bot lock, creates a private read-only SQLite snapshot, and uses only executions belonging to the verified ticker/contract. Actual BUY-cycle notionals can replace the configured notional when the minimum sample threshold is met. Actual commissions and adverse slippage relative to the latest same-side quote at or before each fill are aggregated by broker order; the 75th-percentile supported side cost can raise—but never lower—the configured execution-cost reserve. The source database is never modified.</p>
 <p>This calibration improves the replay's notional, liquidity, commission, and slippage assumptions. It does not import historical BouncyBot settings into the Market Replay search, does not use future quotes, and does not imply that a hypothetical order would receive an actual historical fill.</p>
 {calibration_table}</section>
+<section><h2>Protective SELL policy comparison</h2>
+<p>The optimizer treats the optional stop-loss function as a separate risk-policy layer before the full ATR search. At the unchanged 14×60 ATR profile it compares the disabled control, bounded manual trailing-stop percentages, and bounded ATR-adaptive protective multipliers. An enabled policy advances only when at least three adjacent values form a stable near-best region, protective exits occur across several trading days, score and tail-risk evidence improve versus disabled, and an ATR-adaptive value is not almost entirely clamp-bound.</p>
+<p>For every supported policy, the complete three-stage ATR search is then rerun conditionally under that policy and under the disabled control. A protective trail is submitted immediately after the modeled BUY, follows favorable genuine Last events, and is cancelled before the normal minimum-profit SELL becomes active. The recording does not contain broker cancellation acknowledgements, so cancel-before-replace is modeled atomically at the qualifying market event. The final report still publishes exactly one complete profile, including whether protective SELL is disabled, manual, or ATR-adaptive.</p>
+{protective_policy_table}
+<h3>Protective-exit diagnostics for the recommended profile</h3>
+<p>After each modeled protective exit, the report follows executable bids only within the same verified continuity chain and only until the next modeled BUY. “Further loss avoided” measures subsequent downside below the protective fill; “recovery regret” measures later executable recovery above the fill. These diagnostics are descriptive and never enter candidate ranking.</p>
+{protective_trade_table}</section>
 <section><h2>Recording coverage and integrity</h2>
 <p>The importer accepted {_escape(rec.input_recording_count)} Market Replay recording(s) with format version(s) {_escape(rec.format_label)}. Version 2 is the legacy ZIP format; version 3 is the SQLite format with per-record integrity hashes, chain hashes, committed checkpoints, and explicit RTH-period metadata. Every input was copied to a private temporary location, verified independently, analyzed from the copy, and rechecked for source mutation.</p>
-<p>Recordings are combined only when symbol, positive conId, currency, security type, exchange time zone, and minimum tick agree. Exchange-routing metadata may differ and is reported. A trading date represented by overlapping files or more than one RTH fragment is excluded in full; fragments are never spliced because continuous ATR, anchor, order, and position state cannot be proved.</p>
+<p>Recordings are combined only when symbol, positive conId, currency, security type, exchange time zone, and minimum tick agree. Exchange-routing metadata may differ and is reported. Non-overlapping same-date fragments with compatible RTH schedules are stitched chronologically. The selector maximizes verified wall-clock coverage first, then live-only coverage, normal-close evidence, retained strategy rows, and fewer stitches on exact ties. Inter-fragment outages remain visible to all quality gates. Overlapping streams are never interleaved; conflicting schedule metadata excludes the date.</p>
 <p><strong>Combined input identity:</strong> <code>{_escape(rec.sha256)}</code> · <strong>conId:</strong> {_escape(rec.con_id)} · <strong>data:</strong> {_escape(rec.data_start_utc)} through {_escape(rec.data_end_utc)} · <strong>raw rows:</strong> {_escape(rec.raw_row_count)} · <strong>retained strategy rows:</strong> {_escape(rec.retained_row_count)}</p>
-<h3>Input recordings</h3>{input_recording_table}<h3>Session-quality evidence</h3>{session_quality_table}<h3>Excluded trading dates</h3>{excluded_session_table}
+<h3>Input recordings</h3>{input_recording_table}<h3>Same-date fragment decisions</h3>{fragment_evidence_table}<h3>Session-quality evidence</h3>{session_quality_table}<h3>Excluded trading dates</h3>{excluded_session_table}
 <p>Only primary-eligible sessions can authorize a changed recommendation. A session must cover the RTH boundaries within the configured tolerance, have explicit normal-close evidence, use live data, contain no recorded connectivity-loss event, avoid excessive retained-event gaps, and provide sufficient genuine Last-event density. A container-level <code>complete</code> flag does not convert a manually stopped, sample, or interrupted RTH period into a complete market path. When no session passes these gates, the candidate search is exploratory and the unchanged control is displayed for reference.</p>
 <p>All raw rows are validated before optimization. The in-memory strategy stream may then discard only redundant size-, volume-, or high/low-only updates that cannot change the selected strategy price, a Last-trigger event, stop normalization, modeled fill, feed selection, or UTC-second state. Every Last event, full snapshot, price/feed change, first/final row, and at least one usable state per UTC second is retained. The raw and retained counts are reported separately so this reduction is auditable.</p>
 <p>Format-3 periods marked <code>active</code> after an interrupted recorder are valid recovery evidence. When such a period has no committed observed end, the optimizer uses the last committed tick receipt time as a conservative observed end and keeps that session right-censored. Recorder wall-clock reversals are reported; monotonic <code>elapsed_ns</code> and sequence remain authoritative for event order, while affected evidence is marked unstable.</p>
@@ -914,7 +1050,7 @@ def _html(result: MarketReplayAnalysisResult) -> str:
 <h3>Advanced evidence summary</h3>{advanced_table}</section>
 <section><h2>Recommended-profile session results</h2>{session_table}</section>
 <section class="warning"><h2>Interpretation limits</h2>
-<p>This workflow analyzes the selected recording set under standardized entry rules. Optional SQLite calibration uses actual fills only to derive conservative notional and execution-cost assumptions; it does not import BouncyBot's historical strategy state, protective exits, account constraints, or user start/stop times. Overnight state is carried only through provably continuous primary-eligible recordings and deliberately breaks at ambiguous gaps. Top-of-book size remains a fail-closed evidence gate rather than a full depth or partial-fill model. The standardized replay therefore answers: “Which bounded-grid profile behaved best under this documented simulator and evidence set?” It does not establish the best future settings for the ticker.</p>
+<p>This workflow analyzes the selected recording set under standardized entry rules. Optional SQLite calibration uses actual fills only to derive conservative notional and execution-cost assumptions; it does not import BouncyBot's historical strategy state, historical protective-order state, account constraints, or user start/stop times. The protective SELL policies in this report are simulated counterfactuals from the recorded market path. Cancellation before a normal profit-taking SELL is modeled as an atomic cancel-and-replace because the recording does not contain broker cancellation acknowledgements; the live bot waits for cancellation confirmation. Overnight state is carried only through provably continuous primary-eligible recordings and deliberately breaks at ambiguous gaps. Top-of-book size remains a fail-closed evidence gate rather than a full depth or partial-fill model. The standardized replay therefore answers: “Which bounded-grid ATR and protective-SELL profile behaved best under this documented simulator and evidence set?” It does not establish the best future settings for the ticker.</p>
 <p>A single week remains a small in-sample research set even when it contains millions of events. Bootstrap and leave-one-day-out tests are rejection checks, not independent out-of-sample proof. Consecutive sessions linked by an overnight position count as fewer independent bootstrap units than their raw day count. Prefer many unbiased full-session recordings from different volatility regimes and several independent position-continuity chains, then freeze and validate the one suggested profile on later unseen recordings and forward paper trading before considering any production change.</p></section>
 </main></body></html>"""
 
@@ -958,6 +1094,7 @@ def write_market_replay_report(result: MarketReplayAnalysisResult) -> MarketRepl
         profile_rows = [_profile_row(result)]
         issue_rows = [{"issue": issue} for issue in result.global_issues]
         input_rows = list(result.recording.input_components)
+        fragment_rows = list(result.recording.fragment_evidence)
         excluded_rows = list(result.recording.excluded_sessions)
         quality_rows = list(result.session_quality)
         window_rows = list(result.window_search)
@@ -974,6 +1111,12 @@ def write_market_replay_report(result: MarketReplayAnalysisResult) -> MarketRepl
         boundary_rows = list(result.boundary_evidence)
         stress_rows = list(result.assumption_stress_evidence)
         gate_rows = list(result.recommendation_gates)
+        protective_policy_rows = list(result.protective_policy_evidence)
+        protective_trade_rows = [
+            row
+            for row in trade_rows
+            if str(row.get("exit_type") or "").strip().lower() == "protective"
+        ]
 
         (stage / "index.html").write_text(_html(result), encoding="utf-8")
         _write_json(stage / "market_replay_analysis.json", result.to_jsonable())
@@ -993,11 +1136,29 @@ def write_market_replay_report(result: MarketReplayAnalysisResult) -> MarketRepl
             ],
         )
         _write_csv(
+            stage / "recording_fragment_evidence.csv",
+            fragment_rows,
+            list(fragment_rows[0])
+            if fragment_rows
+            else [
+                "session_date",
+                "status",
+                "recording_sha256",
+                "source_period_id",
+                "merged_period_id",
+                "observed_start_utc",
+                "observed_end_utc",
+                "retained_rows",
+                "reason",
+            ],
+        )
+        _write_csv(
             stage / "excluded_sessions.csv",
             excluded_rows,
             list(excluded_rows[0])
             if excluded_rows
             else [
+                "reason_type",
                 "session_date",
                 "period_count",
                 "recording_hashes",
@@ -1012,6 +1173,7 @@ def write_market_replay_report(result: MarketReplayAnalysisResult) -> MarketRepl
             else [
                 "session_date",
                 "period_id",
+                "source_recording_sha256s",
                 "manifest_status",
                 "source_finalized",
                 "coverage_pct",
@@ -1091,6 +1253,60 @@ def write_market_replay_report(result: MarketReplayAnalysisResult) -> MarketRepl
             "open_at_end",
         ]
         _write_csv(stage / "recommended_simulated_trades.csv", trade_rows, trade_fields)
+        _write_csv(
+            stage / "protective_sell_policy_comparison.csv",
+            protective_policy_rows,
+            list(protective_policy_rows[0])
+            if protective_policy_rows
+            else [
+                "rank",
+                "mode",
+                "value",
+                "label",
+                "score",
+                "score_delta_vs_disabled",
+                "protective_exits",
+                "protective_cancellations",
+                "stable_region_center",
+                "eligible",
+                "selected_policy",
+                "selected_for_atr_search",
+                "recovery_observed_exits",
+                "recovered_to_buy_pct",
+                "normal_activation_observed_exits",
+                "later_reached_normal_activation_pct",
+                "median_further_loss_avoided_bps",
+                "median_recovery_regret_bps",
+                "overnight_protective_exits",
+                "decision",
+            ],
+        )
+        _write_csv(
+            stage / "protective_sell_trade_diagnostics.csv",
+            protective_trade_rows,
+            list(protective_trade_rows[0])
+            if protective_trade_rows
+            else [
+                "continuity_chain_id",
+                "session_date",
+                "cycle_number",
+                "buy_time_utc",
+                "buy_price",
+                "sell_time_utc",
+                "sell_price",
+                "exit_type",
+                "protective_sell_mode",
+                "protective_sell_value",
+                "protective_sell_pct",
+                "protective_initial_stop_price",
+                "protective_trigger_price",
+                "protective_recovered_to_buy",
+                "protective_reached_normal_activation",
+                "protective_loss_avoided_bps",
+                "protective_regret_bps",
+                "protective_observation_end_utc",
+            ],
+        )
         _write_csv(stage / "control_session_results.csv", control_sessions, session_fields)
         _write_csv(
             stage / "execution_calibration.csv",
@@ -1192,9 +1408,9 @@ Input recordings: {result.recording.input_recording_count}
 Recording formats: {result.recording.format_label} ({result.recording.container_format})
 Ticker: {result.recording.symbol}
 
-Open index.html in a browser. The report contains exactly one complete ATR profile to evaluate in forward paper trading. ATR period and bar duration are narrowed with a representative multiplier mini-grid before the full multiplier and minimum-clamp search. A changed profile is published only when all recommendation authorization gates pass, including primary source quality, paired candidate/control evidence, whole-day and moving-block bootstrap, exact leave-one-day-out reselection, ATR phase, score-policy stability, Pareto non-domination, resolved search boundaries, assumption stress, economic continuity blocks, selection-aware out-of-bag bootstrap, and chronological walk-forward validation. Otherwise the unchanged control is shown for reference because no data-supported change was found. The output is not a mathematical or future-market optimum.
+Open index.html in a browser. The report contains exactly one complete ATR and protective-SELL policy profile to evaluate in forward paper trading. Before the ATR search, the optimizer compares protective SELL disabled with bounded manual and ATR-adaptive native trailing-stop policies at the unchanged ATR control. Only the disabled policy and one independently supported protective-policy region can advance into the ATR-window and multiplier search. ATR period and bar duration are then narrowed with a representative multiplier mini-grid before the full multiplier and minimum-clamp search. A changed profile is published only when all recommendation authorization gates pass, including protective-policy stability, primary source quality, paired candidate/control evidence, whole-day and moving-block bootstrap, exact leave-one-day-out reselection, ATR phase, score-policy stability, Pareto non-domination, resolved search boundaries, assumption stress, economic continuity blocks, selection-aware out-of-bag bootstrap, and chronological walk-forward validation. Otherwise the unchanged control with protective SELL disabled is shown for reference because no data-supported change was found. The output is not a mathematical or future-market optimum.
 
-By default, continuous overnight replay carries open long positions and already-active native SELL trails across provably consecutive complete primary-eligible RTH recordings. Continuity fails closed at missing weekdays/holiday ambiguity, overlap, or quality failures. Optional BouncyBot SQLite calibration is read-only and can increase the conservative execution-cost reserve and replace the assumed notional when sufficient matching execution evidence exists. It does not import historical strategy state or guarantee hypothetical fills. Top-of-book size remains a fail-closed evidence gate rather than a depth or partial-fill model, and the manifest minimum tick is used because a historical market-rule ladder is not stored.
+Non-overlapping same-date fragments with compatible RTH schedules are stitched using a deterministic coverage-first selector. Inter-fragment gaps remain visible to quality gates; overlapping tick streams are never interleaved, and conflicting schedules exclude the date. By default, continuous overnight replay carries open long positions and already-active normal or protective native SELL trails across provably consecutive complete primary-eligible RTH recordings. Continuity fails closed at missing weekdays/holiday ambiguity or quality failures. A protective trail is submitted immediately after a modeled BUY, follows genuine Last events, and is cancelled before a normal minimum-profit SELL replaces it. Optional BouncyBot SQLite calibration is read-only and can increase the conservative execution-cost reserve and replace the assumed notional when sufficient matching execution evidence exists. It does not import historical protective-policy state or guarantee hypothetical fills. Top-of-book size remains a fail-closed evidence gate rather than a depth or partial-fill model, and the manifest minimum tick is used because a historical market-rule ladder is not stored.
 """
         (stage / "README_REPORT.txt").write_text(readme, encoding="utf-8")
         manifest = {
@@ -1224,6 +1440,7 @@ By default, continuous overnight replay carries open long positions and already-
             "boundary_evidence": result.boundary_evidence,
             "assumption_stress_evidence": result.assumption_stress_evidence,
             "recommendation_gates": result.recommendation_gates,
+            "protective_policy_evidence": result.protective_policy_evidence,
             "exploratory_only": result.exploratory_only,
             "ticker": result.recording.symbol,
             "search_contract": result.search_contract,

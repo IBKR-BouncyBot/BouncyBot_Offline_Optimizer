@@ -118,13 +118,13 @@ Release reproducibility is also separated from application analysis. The Windows
 
 The Market Replay input boundary accepts an immutable set of at most 64 `.ibrec` paths. Every file is copied and verified independently before combination. The combiner requires matching symbol, positive conId, currency, security type, exchange time zone, and minimum tick. Content-identical inputs are rejected. Exchange-routing metadata may differ only when the stronger instrument identity agrees, and that difference is reported.
 
-One complete, unambiguous RTH period is required per trading date. A date represented by overlapping recordings or multiple interrupted periods is excluded in full; the optimizer never joins fragments because ATR bars, moving anchors, trailing-order state, and positions cannot be proven continuous across the gap. Combined identities use only component roles, sizes, hashes, formats, and canonical ordering, so input order, source path, and filename do not alter the result.
+The combined dataset contains at most one RTH period per trading date. When verified same-date fragments have compatible schedules, a deterministic interval selector maximizes observed wall-clock coverage first, then live-only coverage, normal-close evidence, retained strategy rows, fewer stitches, and a content-derived tie-break. Selected fragments are rebased onto one strictly increasing monotonic clock while preserving their real wall-clock outage, so ATR freshness, quote age, event gaps, and Last-density checks see the interruption. Overlapping streams are never interleaved, and conflicting scheduled RTH boundaries exclude the date. Combined identities use only component roles, sizes, hashes, formats, and canonical ordering, so input order, source path, and filename do not alter the result.
 
 Recommendation authorization is separate from raw candidate ranking. A changed stable-region center must beat the unchanged control on identical complete sessions, have positive median and mean returns, improve at least 60% of paired dates, retain at least 80% of control trading-day participation, remain within tail-risk tolerances, survive 2,000 shared day-or-continuity-block bootstrap draws, stay positive after every complete three-stage leave-one-day-out rerun, and remain above control under five-second ATR phase stress. Any paired right-censored or unmarked open outcome blocks a change. Otherwise the single published profile is the unchanged control.
 
 ## v1.8 continuous replay and calibration boundary
 
-`optimizer.market_replay` evaluates retained periods in chronological order. `_ReplayCarryState` is the only state object allowed to cross an RTH boundary. Carry is authorized only when both adjacent periods pass the primary quality gate and the next observed date is the conservatively expected weekday. The carried object can contain an open long, actual modeled BUY basis and quantity, cumulative portfolio equity, continuity-chain drawdown, an active or triggered SELL, and the detailed trade record. BUY trails are never carried. A missing day, ambiguous holiday, overlap, partial session, source-quality failure, or absent closing bid mark terminalizes the position instead of inventing state.
+`optimizer.market_replay` evaluates retained periods in chronological order. `_ReplayCarryState` is the only state object allowed to cross an RTH boundary. Carry is authorized only when both adjacent periods pass the primary quality gate and the next observed date is the conservatively expected weekday. The carried object can contain an open long, actual modeled BUY basis and quantity, cumulative portfolio equity, continuity-chain drawdown, an active or triggered SELL, and the detailed trade record. BUY trails are never carried. A missing day, ambiguous holiday, schedule conflict, partial session, source-quality failure, or absent closing bid mark terminalizes the position instead of inventing state. A stitched period is treated like any other period: an excessive preserved gap prevents primary eligibility and therefore prevents overnight carry.
 
 An open HOLD re-warms the new session's ATR before deriving an unsubmitted normal SELL. A SELL trail that was already submitted retains its locked trail percentage, stop, and running high. Sequence counters are reset at the recording boundary so the first genuine Last event in the new file can update or trigger that existing trail. A triggered SELL can remain pending until a valid bid appears.
 
@@ -144,3 +144,39 @@ A changed Market Replay recommendation is now a two-level process:
 The authorization layer includes exact raw-chronology leave-one-day-out reselection, chronological walk-forward testing, fixed-profile whole-day/continuity-block bootstrap, circular moving-block bootstrap, selection-aware out-of-bag bootstrap, multiple score policies, Pareto non-domination, deterministic search-boundary extension, assumption stress, ATR phase stress, and economic continuity-block comparison. Every gate is exported by name. Failure of any required gate returns the unchanged control rather than silently choosing the numerically strongest profile.
 
 Exact leave-one-day-out removes the date before replay and reconstructs overnight continuity. Walk-forward training never sees validation dates, while validation replay may legitimately carry a position across the training/validation boundary. Calibration estimates are date-cross-fitted so same-day or future executions cannot calibrate an earlier decision.
+
+## v2.0 protective SELL policy boundary
+
+Version 2.0 adds a risk-policy layer before the three-stage Market Replay ATR
+search. The layer is part of `optimizer.market_replay`; it does not change the
+SQLite/capture workflow. It compares the no-stop control with a bounded set of
+manual and ATR-adaptive protective native trailing SELL policies while every
+ordinary ATR entry and profit-exit setting remains at the unchanged control.
+Only the disabled control and at most one supported adjacent policy-region
+centre can advance. Stage 1 and Stage 2 are then run independently for each
+advancing policy, and Stage 3 is built only from that policy's own narrowed ATR
+windows. Stable regions and boundary probes never connect or compare profiles
+with different protective policies.
+
+`_ReplayCarryState` now owns the protective order lifecycle that may cross an
+RTH boundary: locked protective percentage, normalized stop, running high,
+placement sequence, trigger reference, pending market-style SELL, and the
+contemporaneous normal-SELL activation threshold used only for diagnostics.
+The order is placed after a modeled BUY, follows genuine Last updates, and
+requires a fresh bid to complete. A normal minimum-profit SELL clears the
+protective state before replacement. Because `.ibrec` has no broker order
+acknowledgements, cancellation and replacement are an explicitly documented
+atomic replay approximation; the live bot waits for cancellation confirmation.
+
+Protective-policy screening and final recommendation authorization remain
+separate. The screen requires a multi-point adjacent region, minimum stop-out
+and trading-day evidence, practical score improvement, tail-risk
+non-inferiority, and ATR-clamp identifiability. The final complete profile still
+passes the entire v1.9 authorization stack against the unchanged disabled
+control. If either layer fails, the single published profile is the unchanged
+ATR control with protective SELL disabled.
+
+`optimizer.market_replay_reports` exports policy-level evidence and detailed
+protective exits. Post-exit recovery and avoided-loss diagnostics are generated
+only after detailed replay and never feed candidate ranking, preventing
+hindsight diagnostics from becoming a selection input.

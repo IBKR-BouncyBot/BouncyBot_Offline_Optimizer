@@ -588,3 +588,104 @@ def test_normalization_validates_the_stored_rounded_values(
     assert near_limit.buy_execution_cost_bps_per_side == pytest.approx(9_999.999999)
     assert near_limit.sell_execution_cost_bps_per_side == pytest.approx(9_999.999999)
     assert near_limit.normalized() == near_limit
+
+
+def _fragment_recordings(tmp_path: Path) -> tuple[Path, Path, int]:
+    """Split one fixture session into two same-date recordings with a gap."""
+
+    rows, periods = make_ticks(sessions=1)
+    first_rows = [dict(row) for row in rows[:60]]
+    second_rows = []
+    for index, row in enumerate(rows[70:], start=1):
+        item = dict(row)
+        item["sequence"] = index
+        second_rows.append(item)
+
+    def _fragment_period(fragment_rows: list[dict[str, object]]) -> dict[str, object]:
+        period = dict(periods[0])
+        period["observed_start_utc"] = fragment_rows[0]["captured_at_utc"]
+        period["observed_end_utc"] = fragment_rows[-1]["captured_at_utc"]
+        period["first_tick_sequence"] = fragment_rows[0]["sequence"]
+        period["last_tick_sequence"] = fragment_rows[-1]["sequence"]
+        period["tick_count"] = len(fragment_rows)
+        return period
+
+    first = write_v3(tmp_path / "morning.ibrec", first_rows, [_fragment_period(first_rows)])
+    second = write_v3(tmp_path / "afternoon.ibrec", second_rows, [_fragment_period(second_rows)])
+    gap_ns = (70 - 59) * 15 * 1_000_000_000
+    return first, second, gap_ns
+
+
+def test_same_date_fragments_are_stitched_into_one_period(tmp_path: Path) -> None:
+    """Non-overlapping recorder restarts merge instead of dropping the date.
+
+    The stitched period keeps every fragment's recorder-monotonic spacing and
+    measures the true wall-clock outage across the stitch, so ATR buckets,
+    quote ages, and the gap gates see exactly what one recorder with a
+    mid-session outage would have produced.
+    """
+
+    from optimizer.ibrec import load_ibrec_set
+
+    first, second, gap_ns = _fragment_recordings(tmp_path)
+    recording = load_ibrec_set(
+        MarketReplayConfig((first, second), tmp_path / "reports")
+    )
+    assert len(recording.periods) == 1
+    period = recording.periods[0]
+    assert period.session_date == "20260105"
+    assert period.tick_count == 60 + 51
+    assert len(period.source_recording_sha256s) == 2
+    assert "+" in period.source_recording_sha256
+    assert period.observed_start_utc == recording.ticks[0].captured_at_utc
+    assert period.observed_end_utc == recording.ticks[-1].captured_at_utc
+
+    elapsed = [tick.elapsed_ns for tick in recording.ticks]
+    assert elapsed == sorted(elapsed)
+    boundary_deltas = [
+        later - earlier for earlier, later in zip(elapsed, elapsed[1:])
+    ]
+    assert max(boundary_deltas) == gap_ns
+    assert boundary_deltas.index(gap_ns) == 59
+    assert all(tick.rth_period_id == period.period_id for tick in recording.ticks)
+    assert any("Merged trading date 20260105" in issue for issue in recording.issues)
+
+    reordered = load_ibrec_set(
+        MarketReplayConfig((second, first), tmp_path / "reports-b")
+    )
+    assert reordered.sha256 == recording.sha256
+    assert [
+        (tick.elapsed_ns, tick.bid) for tick in reordered.ticks
+    ] == [(tick.elapsed_ns, tick.bid) for tick in recording.ticks]
+
+
+def test_set_errors_name_the_offending_recording(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import optimizer.ibrec as ibrec_module
+    from optimizer.ibrec import IbrecError, inspect_ibrec_set, load_ibrec_set
+
+    empty = tmp_path / "empty.ibrec"
+    other = tmp_path / "other.ibrec"
+    empty.write_bytes(b"")
+    other.write_bytes(b"")
+
+    monkeypatch.setattr(
+        ibrec_module,
+        "inspect_ibrec",
+        lambda config: {"row_count": 0},
+    )
+    with pytest.raises(IbrecError, match="empty.ibrec: Recording contains no market-data rows"):
+        inspect_ibrec_set(
+            MarketReplayConfig((empty, other), tmp_path / "reports")
+        )
+
+    def _fail(config, progress=None):
+        raise IbrecError("Recording contains no market-data rows.")
+
+    monkeypatch.setattr(ibrec_module, "load_ibrec", _fail)
+    with pytest.raises(IbrecError, match="empty.ibrec: Recording contains no market-data rows"):
+        load_ibrec_set(
+            MarketReplayConfig((empty, other), tmp_path / "reports")
+        )

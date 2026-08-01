@@ -197,7 +197,7 @@ def test_multiple_recordings_require_complete_identity_metadata(tmp_path: Path) 
         combine_ibrec_recordings(recordings)
 
 
-def test_overlapping_dates_are_excluded_in_full_instead_of_spliced(
+def test_conflicting_full_overlap_keeps_one_deterministic_fragment(
     tmp_path: Path,
 ) -> None:
     paths = _daily_recordings(tmp_path / "recordings", days=2)
@@ -211,21 +211,43 @@ def test_overlapping_dates_are_excluded_in_full_instead_of_spliced(
     recording = load_ibrec_set(
         MarketReplayConfig((paths[0], paths[1], overlap), tmp_path / "reports")
     )
-    assert len(recording.periods) == 1
-    assert recording.periods[0].session_date == "20260106"
-    assert recording.excluded_sessions[0]["session_date"] == "20260105"
-    assert "never splice" not in " ".join(recording.issues).lower()
-    assert "excluded" in " ".join(recording.issues).lower()
+    # The conflicted date is retained from exactly one fragment instead of
+    # being dropped; overlapping streams are still never interleaved.
+    assert [period.session_date for period in recording.periods] == [
+        "20260105",
+        "20260106",
+    ]
+    assert recording.excluded_sessions == []
+    joined = " ".join(recording.issues).lower()
+    assert "dropped an overlapping fragment" in joined
+    assert "never interleaved" in joined
+    reordered = load_ibrec_set(
+        MarketReplayConfig((overlap, paths[1], paths[0]), tmp_path / "reports-b")
+    )
+    assert reordered.sha256 == recording.sha256
+    assert (
+        reordered.periods[0].source_recording_sha256
+        == recording.periods[0].source_recording_sha256
+    )
 
 
-def test_all_overlapping_dates_fail_closed(tmp_path: Path) -> None:
+def test_identical_window_conflicts_no_longer_fail_closed(tmp_path: Path) -> None:
     rows, periods = make_ticks(sessions=1)
     first = write_v3(tmp_path / "first.ibrec", rows, periods)
     changed = [dict(row) for row in rows]
     changed[-1]["ask"] = float(changed[-1]["ask"]) + 0.001
     second = write_v3(tmp_path / "second.ibrec", changed, periods)
-    with pytest.raises(IbrecError, match="No unambiguous trading date"):
-        load_ibrec_set(MarketReplayConfig((first, second), tmp_path / "reports"))
+    recording = load_ibrec_set(
+        MarketReplayConfig((first, second), tmp_path / "reports")
+    )
+    assert len(recording.periods) == 1
+    assert recording.periods[0].tick_count == len(rows)
+    assert len(recording.periods[0].source_recording_sha256s) == 1
+    assert "dropped an overlapping fragment" in " ".join(recording.issues).lower()
+    swapped = load_ibrec_set(
+        MarketReplayConfig((second, first), tmp_path / "reports-b")
+    )
+    assert swapped.sha256 == recording.sha256
 
 
 def test_multi_recording_analysis_and_report_are_deterministic(

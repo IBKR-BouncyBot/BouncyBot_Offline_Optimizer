@@ -14,7 +14,7 @@ import tempfile
 import zipfile
 from collections import Counter
 from contextlib import closing
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -1580,15 +1580,223 @@ def _period_ticks_for_combination(
     ]
 
 
+@dataclass(slots=True, frozen=True)
+class _FragmentCandidate:
+    """One verified same-date recording fragment considered for stitching."""
+
+    period: IbrecPeriod
+    ticks: tuple[IbrecTick, ...]
+    fingerprint: str
+    start: float
+    end: float
+    live_only: bool
+    normal_close: bool
+    clock_monotonic: bool
+
+    @property
+    def coverage_ns(self) -> int:
+        """Return observed wall-clock coverage without depending on file order."""
+
+        return max(0, int(round((self.end - self.start) * 1_000_000_000)))
+
+    @property
+    def signature(self) -> tuple[float, float, str, int]:
+        return (self.start, self.end, self.fingerprint, self.period.period_id)
+
+
+@dataclass(slots=True, frozen=True)
+class _FragmentSelection:
+    """Dynamic-programming state for deterministic interval selection."""
+
+    coverage_ns: int = 0
+    live_coverage_ns: int = 0
+    normal_close_count: int = 0
+    retained_rows: int = 0
+    indices: tuple[int, ...] = ()
+
+
+def _boundary_tick_signature(tick: IbrecTick) -> tuple[Any, ...]:
+    """Return replay-relevant boundary state without recorder-local counters."""
+
+    return (
+        tick.captured_at_utc,
+        tick.timestamp,
+        tick.symbol,
+        tick.con_id,
+        tick.source_time_utc,
+        tick.bid,
+        tick.bid_size,
+        tick.ask,
+        tick.ask_size,
+        tick.last,
+        tick.last_size,
+        tick.open,
+        tick.high,
+        tick.low,
+        tick.close,
+        tick.volume,
+        tick.mark_price,
+        tick.market_data_type,
+        tick.changed_fields,
+        tick.full_snapshot,
+    )
+
+
+def _fragments_are_compatible(
+    left: _FragmentCandidate,
+    right: _FragmentCandidate,
+) -> bool:
+    """Return whether fragments can be joined without conflicting coverage."""
+
+    if not left.clock_monotonic or not right.clock_monotonic:
+        # A receipt-clock reversal is valid single-recording recovery evidence,
+        # but it cannot safely establish chronology against another recorder.
+        return False
+    if left.end < right.start:
+        return True
+    if left.end > right.start:
+        return False
+    # Equal boundary timestamps are safe only when both recorders captured the
+    # exact same replay-relevant state.  The duplicate boundary row is removed
+    # during stitching.  Conflicting same-instant states remain overlapping.
+    return _boundary_tick_signature(left.ticks[-1]) == _boundary_tick_signature(
+        right.ticks[0]
+    )
+
+
+def _prefer_fragment_selection(
+    left: _FragmentSelection,
+    right: _FragmentSelection,
+    order: list[_FragmentCandidate],
+) -> _FragmentSelection:
+    """Prefer coverage, then evidence rows, then fewer stitches, deterministically.
+
+    Retained-row count alone is not a safe objective: a dense partial feed can
+    contain more callbacks than a sparse complete recording.  Primary strategy
+    reconstruction benefits first from the widest verified time coverage.
+    Equal-coverage choices prefer live-only evidence and normal-close evidence,
+    then row count, fewer fragments (less synthetic stitching), and finally a
+    content-derived lexical signature.
+    """
+
+    left_rank = (
+        left.coverage_ns,
+        left.live_coverage_ns,
+        left.normal_close_count,
+        left.retained_rows,
+        -len(left.indices),
+    )
+    right_rank = (
+        right.coverage_ns,
+        right.live_coverage_ns,
+        right.normal_close_count,
+        right.retained_rows,
+        -len(right.indices),
+    )
+    if left_rank != right_rank:
+        return left if left_rank > right_rank else right
+    left_signature = tuple(order[index].signature for index in left.indices)
+    right_signature = tuple(order[index].signature for index in right.indices)
+    return left if left_signature <= right_signature else right
+
+
+def _select_non_overlapping_fragments(
+    fragments: list[_FragmentCandidate],
+) -> tuple[list[_FragmentCandidate], list[_FragmentCandidate]]:
+    """Choose the best deterministic non-overlapping same-date fragment set.
+
+    The dynamic program maximizes observed wall-clock coverage first and
+    retained strategy evidence second.  Ranges touching at a boundary are
+    compatible; only strict overlap conflicts.  Exact ties prefer fewer
+    stitches and then a content-derived lexical signature, so input order,
+    path, and filename cannot affect the result.
+    """
+
+    order = sorted(
+        fragments,
+        key=lambda item: (
+            item.end,
+            item.start,
+            item.fingerprint,
+            item.period.period_id,
+        ),
+    )
+    # Ordinary weighted interval scheduling can retain only one best prefix for
+    # each end-time index. That is insufficient here because fragments that
+    # merely touch are compatible only when their replay-relevant boundary
+    # rows agree. Two fragments can share the same end timestamp while only
+    # one can precede the next fragment. Keep the best chain ending at every
+    # concrete fragment so that boundary compatibility is checked against the
+    # chain's actual final member rather than an unrelated best prefix.
+    ending_at: list[_FragmentSelection] = []
+    best_overall = _FragmentSelection()
+    for index, candidate in enumerate(order):
+        best_ending_here = _FragmentSelection(
+            coverage_ns=candidate.coverage_ns,
+            live_coverage_ns=(candidate.coverage_ns if candidate.live_only else 0),
+            normal_close_count=int(candidate.normal_close),
+            retained_rows=len(candidate.ticks),
+            indices=(index,),
+        )
+        for earlier_index in range(index):
+            if not _fragments_are_compatible(order[earlier_index], candidate):
+                continue
+            previous = ending_at[earlier_index]
+            include = _FragmentSelection(
+                coverage_ns=previous.coverage_ns + candidate.coverage_ns,
+                live_coverage_ns=(
+                    previous.live_coverage_ns
+                    + (candidate.coverage_ns if candidate.live_only else 0)
+                ),
+                normal_close_count=(
+                    previous.normal_close_count + int(candidate.normal_close)
+                ),
+                retained_rows=previous.retained_rows + len(candidate.ticks),
+                indices=(*previous.indices, index),
+            )
+            best_ending_here = _prefer_fragment_selection(
+                include,
+                best_ending_here,
+                order,
+            )
+        ending_at.append(best_ending_here)
+        best_overall = _prefer_fragment_selection(
+            best_ending_here,
+            best_overall,
+            order,
+        )
+    kept_indices = set(best_overall.indices)
+    kept = sorted(
+        (order[index] for index in kept_indices),
+        key=lambda item: (
+            item.start,
+            item.fingerprint,
+            item.period.period_id,
+        ),
+    )
+    dropped = [
+        order[index] for index in range(len(order)) if index not in kept_indices
+    ]
+    return kept, dropped
+
+
 def combine_ibrec_recordings(
     recordings: Iterable[IbrecRecording],
 ) -> IbrecRecording:
     """Combine verified recordings into one deterministic analysis dataset.
 
-    The function is deliberately conservative: one unambiguous complete RTH
-    period is required for each calendar date.  Overlapping recordings and
-    interrupted same-day fragments are reported and excluded rather than being
-    spliced into a synthetic continuous strategy state.
+    Each calendar date is represented by exactly one RTH period in the
+    combined dataset.  When several verified fragments cover one date, the
+    deterministic maximal non-overlapping subset (coverage first, then retained
+    strategy-relevant rows, with content-hash tie-breaking) is stitched
+    chronologically into one period; recorder restarts therefore no longer
+    discard the whole date.
+    Fragments whose observed tick ranges overlap retained coverage are dropped
+    with an explanatory issue: overlapping tick streams are never interleaved,
+    because two capture processes can disagree tick-by-tick and would fabricate
+    a market path neither recorder observed.  Inter-fragment gaps remain fully
+    visible to the coverage, event-gap, and last-event quality gates, exactly
+    as a data outage inside a single recording would be.
     """
 
     ordered = sorted(
@@ -1666,9 +1874,80 @@ def combine_ibrec_recordings(
             by_date.setdefault(period.session_date, []).append((recording, period))
 
     excluded_sessions: list[dict[str, Any]] = []
-    included: list[tuple[IbrecRecording, IbrecPeriod]] = []
+    combined_periods: list[IbrecPeriod] = []
+    combined_ticks: list[IbrecTick] = []
+    fragment_evidence: list[dict[str, Any]] = []
+    next_sequence = 1
+    next_period_id = 1
+    merged_date_count = 0
+    dropped_fragment_count = 0
     for session_date, values in sorted(by_date.items()):
-        if len(values) != 1:
+        fragments: list[_FragmentCandidate] = []
+        for recording, period in values:
+            fingerprint = _component_fingerprint(recording.input_components)
+            source_ticks = sorted(
+                _period_ticks_for_combination(recording, period),
+                key=lambda tick: (tick.elapsed_ns, tick.sequence),
+            )
+            if not source_ticks:
+                if len(values) > 1:
+                    issues.append(
+                        f"Trading date {session_date}: a fragment from recording "
+                        f"{fingerprint[:12]} retained no strategy-relevant rows and "
+                        "was skipped."
+                    )
+                fragment_evidence.append(
+                    {
+                        "session_date": session_date,
+                        "status": "dropped_no_rows",
+                        "recording_sha256": fingerprint,
+                        "source_period_id": period.period_id,
+                        "merged_period_id": "",
+                        "observed_start_utc": period.observed_start_utc,
+                        "observed_end_utc": period.observed_end_utc,
+                        "retained_rows": 0,
+                        "reason": "The verified fragment retained no strategy-relevant rows.",
+                    }
+                )
+                continue
+            fragments.append(
+                _FragmentCandidate(
+                    period=period,
+                    ticks=tuple(source_ticks),
+                    fingerprint=fingerprint,
+                    # Receipt timestamps can reverse when the recorder's UTC
+                    # clock moves backwards.  The fragment remains useful as
+                    # isolated quality evidence, but min/max bounds and an
+                    # explicit monotonic flag are required so it cannot be
+                    # stitched into a fabricated chronology.
+                    start=min(tick.timestamp for tick in source_ticks),
+                    end=max(tick.timestamp for tick in source_ticks),
+                    live_only=bool(source_ticks)
+                    and all(tick.market_data_type == 1 for tick in source_ticks),
+                    normal_close=(
+                        (
+                            recording.format_version == 3
+                            and period.status.strip().lower() == "closed"
+                            and period.close_reason.strip().lower()
+                            == "contract_liquid_hours"
+                        )
+                        or (
+                            recording.format_version == 2
+                            and str(recording.manifest.get("status") or "")
+                            .strip()
+                            .lower()
+                            == "complete"
+                            and period.close_reason.strip().lower()
+                            == "legacy_v2_manifest_schedule"
+                        )
+                    ),
+                    clock_monotonic=all(
+                        right.timestamp >= left.timestamp
+                        for left, right in zip(source_ticks, source_ticks[1:])
+                    ),
+                )
+            )
+        if not fragments:
             source_hashes = sorted(
                 {
                     _component_fingerprint(recording.input_components)
@@ -1677,81 +1956,234 @@ def combine_ibrec_recordings(
             )
             excluded_sessions.append(
                 {
+                    "reason_type": "no_retained_rows",
                     "session_date": session_date,
                     "period_count": len(values),
                     "recording_hashes": source_hashes,
                     "reason": (
-                        "More than one RTH period covers this trading date. The optimizer cannot prove continuous "
-                        "ATR, anchor, order, or position state across overlapping files or interrupted fragments."
+                        "The verified RTH period contains no retained strategy-relevant rows."
+                        if len(values) == 1
+                        else f"None of the {len(values)} same-date fragments retained a strategy-relevant row."
                     ),
                 }
             )
             continue
-        included.append(values[0])
-    if not included:
-        raise IbrecError(
-            "No unambiguous trading date remained after excluding overlaps and same-day fragments."
-        )
 
-    combined_periods: list[IbrecPeriod] = []
-    combined_ticks: list[IbrecTick] = []
-    next_sequence = 1
-    ordered_periods = sorted(
-        included,
-        key=lambda item: (
-            item[1].session_date,
-            item[1].open_timestamp,
-            _component_fingerprint(item[0].input_components),
-            item[1].period_id,
-        ),
-    )
-    next_period_id = 1
-    for recording, period in ordered_periods:
-        source_ticks = sorted(
-            _period_ticks_for_combination(recording, period),
-            key=lambda tick: (tick.elapsed_ns, tick.sequence),
+        # Schedule compatibility is evaluated only across fragments that
+        # retained strategy-relevant rows.  An empty recovery fragment must
+        # not invalidate an otherwise valid date merely because its metadata
+        # was incomplete or stale.
+        schedules = sorted(
+            {
+                (fragment.period.open_timestamp, fragment.period.close_timestamp)
+                for fragment in fragments
+            }
         )
-        if not source_ticks:
+        reference_open, reference_close = schedules[0]
+        if any(
+            not math.isclose(open_timestamp, reference_open, rel_tol=0.0, abs_tol=1.0)
+            or not math.isclose(
+                close_timestamp,
+                reference_close,
+                rel_tol=0.0,
+                abs_tol=1.0,
+            )
+            for open_timestamp, close_timestamp in schedules[1:]
+        ):
+            source_hashes = sorted(fragment.fingerprint for fragment in fragments)
+            reason = (
+                "Same-date fragments with retained strategy evidence disagree on "
+                "the scheduled RTH open or close; the optimizer cannot safely "
+                "stitch them into one strategy session."
+            )
             excluded_sessions.append(
                 {
-                    "session_date": period.session_date,
-                    "period_count": 1,
-                    "recording_hashes": [recording.sha256],
-                    "reason": "The verified RTH period contains no retained strategy-relevant rows.",
+                    "reason_type": "schedule_conflict",
+                    "session_date": session_date,
+                    "period_count": len(fragments),
+                    "recording_hashes": source_hashes,
+                    "reason": reason,
                 }
             )
+            for fragment in fragments:
+                fragment_evidence.append(
+                    {
+                        "session_date": session_date,
+                        "status": "excluded_schedule_conflict",
+                        "recording_sha256": fragment.fingerprint,
+                        "source_period_id": fragment.period.period_id,
+                        "merged_period_id": "",
+                        "observed_start_utc": fragment.period.observed_start_utc,
+                        "observed_end_utc": fragment.period.observed_end_utc,
+                        "retained_rows": len(fragment.ticks),
+                        "reason": reason,
+                    }
+                )
             continue
+
+        kept, dropped = _select_non_overlapping_fragments(fragments)
+        for fragment in dropped:
+            dropped_fragment_count += 1
+            issues.append(
+                f"Trading date {session_date}: dropped an overlapping fragment from "
+                f"recording {fragment.fingerprint[:12]} "
+                f"({len(fragment.ticks):,} rows, "
+                f"{fragment.period.observed_start_utc} to "
+                f"{fragment.period.observed_end_utc}); its observed range conflicts "
+                "with retained coverage. Overlapping tick streams are never "
+                "interleaved because two capture processes can disagree tick-by-tick."
+            )
+            fragment_evidence.append(
+                {
+                    "session_date": session_date,
+                    "status": "dropped_overlap",
+                    "recording_sha256": fragment.fingerprint,
+                    "source_period_id": fragment.period.period_id,
+                    "merged_period_id": next_period_id,
+                    "observed_start_utc": fragment.period.observed_start_utc,
+                    "observed_end_utc": fragment.period.observed_end_utc,
+                    "retained_rows": len(fragment.ticks),
+                    "reason": (
+                        "Observed tick coverage overlaps the selected coverage-first "
+                        "non-overlapping fragment set."
+                    ),
+                }
+            )
+
+        template = kept[0].period
+        open_source = min(kept, key=lambda item: item.period.open_timestamp).period
+        close_source = max(kept, key=lambda item: item.period.close_timestamp).period
+        last_period = kept[-1].period
+        fingerprints: list[str] = []
+        for fragment in kept:
+            if fragment.fingerprint not in fingerprints:
+                fingerprints.append(fragment.fingerprint)
+            fragment_evidence.append(
+                {
+                    "session_date": session_date,
+                    "status": "retained_stitched" if len(kept) > 1 else "retained_single",
+                    "recording_sha256": fragment.fingerprint,
+                    "source_period_id": fragment.period.period_id,
+                    "merged_period_id": next_period_id,
+                    "observed_start_utc": fragment.period.observed_start_utc,
+                    "observed_end_utc": fragment.period.observed_end_utc,
+                    "retained_rows": len(fragment.ticks),
+                    "reason": (
+                        "Selected by the deterministic coverage-first maximal "
+                        "non-overlapping fragment algorithm."
+                    ),
+                }
+            )
+
+        # Every fragment keeps its recorder-monotonic intra-fragment spacing.
+        # Later fragments are shifted by the wall-clock offset of their first
+        # retained tick so ATR buckets, quote ages, and event gaps measure the
+        # true elapsed outage across the stitch, exactly as a mid-session data
+        # outage inside a single recording would.  A strictly increasing clock
+        # is enforced even if two recorder monotonic clocks drift.
+        base_start_timestamp = kept[0].ticks[0].timestamp
+        base_elapsed_ns = kept[0].ticks[0].elapsed_ns
+        rebase = len(kept) > 1
+        merged_tick_count = 0
+        boundary_duplicate_count = 0
+        previous_elapsed_ns: int | None = None
+        previous_fragment: _FragmentCandidate | None = None
+        for fragment in kept:
+            fragment_ticks = fragment.ticks
+            if (
+                previous_fragment is not None
+                and previous_fragment.end == fragment.start
+                and _boundary_tick_signature(previous_fragment.ticks[-1])
+                == _boundary_tick_signature(fragment.ticks[0])
+            ):
+                fragment_ticks = fragment_ticks[1:]
+                boundary_duplicate_count += 1
+            if not fragment_ticks:
+                previous_fragment = fragment
+                continue
+            delta_ns = 0
+            if rebase:
+                wall_offset_ns = int(
+                    round(
+                        (fragment_ticks[0].timestamp - base_start_timestamp)
+                        * 1_000_000_000
+                    )
+                )
+                delta_ns = (
+                    base_elapsed_ns + wall_offset_ns - fragment_ticks[0].elapsed_ns
+                )
+                if previous_elapsed_ns is not None:
+                    first_rebased = fragment_ticks[0].elapsed_ns + delta_ns
+                    if first_rebased <= previous_elapsed_ns:
+                        delta_ns += previous_elapsed_ns + 1 - first_rebased
+            for tick in fragment_ticks:
+                combined_ticks.append(
+                    replace(
+                        tick,
+                        sequence=next_sequence,
+                        elapsed_ns=tick.elapsed_ns + delta_ns,
+                        rth_period_id=next_period_id,
+                    )
+                )
+                next_sequence += 1
+                merged_tick_count += 1
+            previous_elapsed_ns = fragment_ticks[-1].elapsed_ns + delta_ns
+            previous_fragment = fragment
+
         combined_periods.append(
             replace(
-                period,
+                template,
                 period_id=next_period_id,
-                tick_count=len(source_ticks),
-                source_recording_sha256=_component_fingerprint(
-                    recording.input_components
-                ),
+                schedule_open_utc=open_source.schedule_open_utc,
+                open_timestamp=open_source.open_timestamp,
+                schedule_close_utc=close_source.schedule_close_utc,
+                close_timestamp=close_source.close_timestamp,
+                observed_start_utc=kept[0].period.observed_start_utc,
+                observed_start_timestamp=kept[0].period.observed_start_timestamp,
+                observed_end_utc=last_period.observed_end_utc,
+                observed_end_timestamp=last_period.observed_end_timestamp,
+                status=last_period.status,
+                close_reason=last_period.close_reason,
+                tick_count=merged_tick_count,
+                source_recording_sha256="+".join(fingerprints),
+                source_recording_sha256s=tuple(fingerprints),
             )
         )
-        for tick in source_ticks:
-            combined_ticks.append(
-                replace(
-                    tick,
-                    sequence=next_sequence,
-                    rth_period_id=next_period_id,
-                )
+        if len(kept) > 1:
+            merged_date_count += 1
+            issues.append(
+                f"Merged trading date {session_date}: stitched {len(kept)} "
+                f"non-overlapping fragment(s) from {len(fingerprints)} recording(s) "
+                f"into one RTH period ({merged_tick_count:,} rows). Inter-fragment "
+                "gaps remain visible to the coverage, event-gap, and last-event "
+                "quality gates."
             )
-            next_sequence += 1
+        if boundary_duplicate_count:
+            issues.append(
+                f"Trading date {session_date}: removed {boundary_duplicate_count:,} "
+                "identical duplicate boundary row(s) while stitching fragments."
+            )
         next_period_id += 1
     if not combined_periods or not combined_ticks:
         raise IbrecError("No strategy-relevant RTH data remained after combining recordings.")
-    # The summary is emitted only after both exclusion sources have run: the
-    # overlap/fragment pass above and the no-retained-rows pass in the period
-    # loop.  Counting earlier understated the total or omitted the summary
-    # entirely when only late exclusions occurred.
+    # Summaries are emitted only after every date has been processed so counts
+    # can never be understated.
+    if merged_date_count:
+        issues.append(
+            f"Merged {merged_date_count:,} trading date(s) from multiple same-date "
+            "fragments instead of excluding them."
+        )
+    if dropped_fragment_count:
+        issues.append(
+            f"Dropped {dropped_fragment_count:,} overlapping same-date fragment(s); "
+            "those dates retain the deterministically selected non-overlapping "
+            "fragment(s)."
+        )
     if excluded_sessions:
         issues.append(
-            f"Excluded {len(excluded_sessions):,} trading date(s): each date must be "
-            "represented by exactly one RTH period that retains at least one "
-            "strategy-relevant row."
+            f"Excluded {len(excluded_sessions):,} trading date(s) because no safe "
+            "merged RTH period could be constructed; see excluded-session and "
+            "fragment diagnostics."
         )
 
     for index, recording in enumerate(ordered, start=1):
@@ -1868,7 +2300,27 @@ def combine_ibrec_recordings(
         data_end_utc=last_tick.captured_at_utc,
         excluded_sessions=excluded_sessions,
         quality_events=combined_quality_events,
+        fragment_evidence=sorted(
+            fragment_evidence,
+            key=lambda item: (
+                str(item.get("session_date") or ""),
+                int(finite_int(item.get("merged_period_id")) or 0),
+                str(item.get("observed_start_utc") or ""),
+                str(item.get("status") or ""),
+                str(item.get("recording_sha256") or ""),
+                int(finite_int(item.get("source_period_id")) or 0),
+            ),
+        ),
     )
+
+
+def _recording_set_error(path: Path, exc: Exception) -> IbrecError:
+    """Attach one unambiguous filename to a per-recording set failure."""
+
+    message = str(exc).strip() or exc.__class__.__name__
+    if path.name.lower() in message.lower():
+        return IbrecError(message)
+    return IbrecError(f"{path.name}: {message}")
 
 
 def load_ibrec_set(
@@ -1933,7 +2385,12 @@ def load_ibrec_set(
                 normalized.min_touch_liquidity_coverage_pct
             ),
         )
-        recording = load_ibrec(single, progress=progress)
+        try:
+            recording = load_ibrec(single, progress=progress)
+        except (IbrecError, OSError) as exc:
+            # Ten selected files and one bare message are undiagnosable; every
+            # per-recording failure names its source file exactly once.
+            raise _recording_set_error(path, exc) from exc
         cumulative_rows += recording.raw_row_count
         cumulative_component_bytes += sum(
             int(component.get("size") or 0)
@@ -1958,21 +2415,29 @@ def inspect_ibrec_set(config: MarketReplayConfig) -> dict[str, Any]:
     """Preflight one or more recordings and summarize their combined identity."""
 
     normalized = config.normalized()
-    details = [
-        inspect_ibrec(
-            MarketReplayConfig(
-                recording_path=path,
-                output_root=normalized.output_root,
-                max_rows=normalized.max_rows,
-                max_input_bytes=normalized.max_input_bytes,
-                max_zip_uncompressed_bytes=normalized.max_zip_uncompressed_bytes,
-                max_recordings=1,
-                min_atr_pct=normalized.min_atr_pct,
-                max_atr_pct=normalized.max_atr_pct,
+    details: list[dict[str, Any]] = []
+    for path in normalized.recording_paths:
+        try:
+            detail = inspect_ibrec(
+                MarketReplayConfig(
+                    recording_path=path,
+                    output_root=normalized.output_root,
+                    max_rows=normalized.max_rows,
+                    max_input_bytes=normalized.max_input_bytes,
+                    max_zip_uncompressed_bytes=normalized.max_zip_uncompressed_bytes,
+                    max_recordings=1,
+                    min_atr_pct=normalized.min_atr_pct,
+                    max_atr_pct=normalized.max_atr_pct,
+                )
             )
-        )
-        for path in normalized.recording_paths
-    ]
+        except (IbrecError, OSError) as exc:
+            raise _recording_set_error(path, exc) from exc
+        if int(finite_int(detail.get("row_count")) or 0) <= 0:
+            # Loading is guaranteed to reject an empty recording, so the
+            # preflight must reject it too; otherwise the interface shows a
+            # green "Ready" state that the analysis immediately contradicts.
+            raise IbrecError(f"{path.name}: Recording contains no market-data rows.")
+        details.append(detail)
     hashes: set[str] = set()
     symbol = str(details[0]["symbol"]).upper()
     con_id = finite_int(details[0].get("con_id")) or 0
