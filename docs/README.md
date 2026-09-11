@@ -1,4 +1,4 @@
-# Documentation index — BouncyBot Offline Optimizer v2.0.1
+# Documentation index — BouncyBot Offline Optimizer v2.3.1
 
 - [Architecture](ARCHITECTURE.md)
 - [Operations and portable placement](OPERATIONS.md)
@@ -7,6 +7,15 @@
 - [Report reference](REPORT_REFERENCE.md)
 - [Database compatibility](DATABASE_COMPATIBILITY.md)
 - [Testing](TESTING.md)
+- [v2.3.1 profile identity and outward-probe correction](V2_3_1_PROFILE_IDENTITY_AND_PROBE_FLOOR.md)
+- [v2.3.0 analysis-wide parallel validation](V2_3_0_ANALYSIS_WIDE_PARALLEL_VALIDATION.md)
+- [v2.2.3 Pyright and resource hardening](V2_2_3_PYRIGHT_AND_RESOURCE_HARDENING.md)
+- [v2.2.2 Ruff quality-gate correction](V2_2_2_RUFF_QUALITY_GATE_CORRECTION.md)
+- [v2.2.1 deep performance audit](V2_2_1_DEEP_PERFORMANCE_AUDIT.md)
+- [v2.2.0 exact refinement acceleration](V2_2_0_EXACT_REFINEMENT_ACCELERATION.md)
+- [v2.1.1 Pyright ATR-provider typing correction](V2_1_1_PYRIGHT_ATR_PROVIDER_TYPING_CORRECTION.md)
+- [v2.1.0 exact compact and process-parallel replay performance](V2_1_0_EXACT_PARALLEL_REPLAY_PERFORMANCE.md)
+- [v2.0.2 unlimited Market Replay rows and recording count](V2_0_2_UNLIMITED_IBREC_ROWS_AND_FILES.md)
 - [v2.0.1 Ruff F841 quality-gate correction](V2_0_1_RUFF_F841_QUALITY_GATE_CORRECTION.md)
 - [v2.0.0 protective SELL policy optimization](V2_0_0_PROTECTIVE_SELL_POLICY_OPTIMIZATION.md)
 - [v1.9.4 same-date fragment merging and diagnostics](V1_9_4_SAME_DATE_FRAGMENT_MERGING_AND_DIAGNOSTICS.md)

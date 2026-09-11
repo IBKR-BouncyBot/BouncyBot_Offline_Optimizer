@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_is_consistent_across_release_files() -> None:
-    assert APP_VERSION == "2.0.1"
+    assert APP_VERSION == "2.3.1"
     assert APP_NAME == "BouncyBot Offline Optimizer"
     for relative in [
         "pyproject.toml",
@@ -25,7 +25,7 @@ def test_version_is_consistent_across_release_files() -> None:
         "scripts/build_windows.ps1",
         "scripts/windows_version_info.txt",
         "docs/README.md",
-        "docs/V2_0_1_RUFF_F841_QUALITY_GATE_CORRECTION.md",
+        "docs/V2_3_1_PROFILE_IDENTITY_AND_PROBE_FLOOR.md",
     ]:
         assert APP_VERSION in (ROOT / relative).read_text(encoding="utf-8-sig")
 
@@ -98,11 +98,35 @@ def test_version_is_consistent_across_release_files() -> None:
     assert "v2.0.0" in (
         ROOT / "docs/V2_0_0_PROTECTIVE_SELL_POLICY_OPTIMIZATION.md"
     ).read_text(encoding="utf-8-sig")
+    assert "v2.0.1" in (
+        ROOT / "docs/V2_0_1_RUFF_F841_QUALITY_GATE_CORRECTION.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.0.2" in (
+        ROOT / "docs/V2_0_2_UNLIMITED_IBREC_ROWS_AND_FILES.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.1.0" in (
+        ROOT / "docs/V2_1_0_EXACT_PARALLEL_REPLAY_PERFORMANCE.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.1.1" in (
+        ROOT / "docs/V2_1_1_PYRIGHT_ATR_PROVIDER_TYPING_CORRECTION.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.2.0" in (
+        ROOT / "docs/V2_2_0_EXACT_REFINEMENT_ACCELERATION.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.2.1" in (
+        ROOT / "docs/V2_2_1_DEEP_PERFORMANCE_AUDIT.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.2.2" in (
+        ROOT / "docs/V2_2_2_RUFF_QUALITY_GATE_CORRECTION.md"
+    ).read_text(encoding="utf-8-sig")
+    assert "v2.2.3" in (
+        ROOT / "docs/V2_2_3_PYRIGHT_AND_RESOURCE_HARDENING.md"
+    ).read_text(encoding="utf-8-sig")
     windows_version = (ROOT / "scripts/windows_version_info.txt").read_text(
         encoding="utf-8-sig"
     )
-    assert "filevers=(2, 0, 1, 0)" in windows_version
-    assert "prodvers=(2, 0, 1, 0)" in windows_version
+    assert "filevers=(2, 3, 1, 0)" in windows_version
+    assert "prodvers=(2, 3, 1, 0)" in windows_version
 
 
 def test_v191_reported_f841_condition_remains_corrected() -> None:
@@ -143,7 +167,7 @@ def test_v140_market_replay_contract_supports_v2_and_v3(tmp_path: Path) -> None:
     contract = market_replay_search_contract(
         MarketReplayConfig(tmp_path / "recording.ibrec", tmp_path / "reports")
     )
-    assert contract["contract_version"] == 15
+    assert contract["contract_version"] == 16
     assert contract["supported_ibrec_versions"] == [2, 3]
     assert contract["atr_window_search"]["stage_1"]["fixed_period"] == 14
     assert contract["atr_window_search"]["stage_2"]["periods"] == [5, 7, 10, 14, 21, 28]
@@ -151,7 +175,8 @@ def test_v140_market_replay_contract_supports_v2_and_v3(tmp_path: Path) -> None:
     assert contract["trading_day_bootstrap_replicates"] == 2_000
     assert "right_censored_session_fraction" in contract["scoring"]
     assert "synthetic source" in contract["evidence_stability_gates"]
-    assert contract["input_recordings"]["maximum"] == 64
+    assert contract["input_recordings"]["recording_count_limit"] is None
+    assert contract["input_recordings"]["aggregate_row_limit"] is None
     assert contract["input_recordings"]["same_day_overlap_policy"].startswith(
         "stitch the deterministic coverage-first"
     )

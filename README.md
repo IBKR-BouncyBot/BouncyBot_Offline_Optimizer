@@ -1,4 +1,4 @@
-# BouncyBot Offline Optimizer v2.0.1
+# BouncyBot Offline Optimizer v2.3.1
 
 A portable, read-only companion application for **BouncyBot - IBKR Portable Trading Bot** with two independent workflows:
 
@@ -44,7 +44,55 @@ For format 3, the importer verifies SQLite structure, foreign keys, every tick/e
 
 Synthetic sample provenance, delayed-only sessions, mixed live/delayed sessions, frozen-feed interruptions, recorder clock reversals, inadequate RTH coverage, material connectivity gaps, sparse Last-event evidence, or an unfinalized source prevent a changed recommendation. Crossed two-sided quotes are retained as quality evidence but are not used as executable touches or stop-reference inputs.
 
-The Market Replay result remains a bounded paper-testing candidate, not a mathematical optimum or live-trading instruction. See the [v2.0.1 Ruff F841 quality-gate correction](docs/V2_0_1_RUFF_F841_QUALITY_GATE_CORRECTION.md), the [v2.0.0 protective SELL policy optimization release note](docs/V2_0_0_PROTECTIVE_SELL_POLICY_OPTIMIZATION.md), the [v1.9.4 same-date fragment merging and diagnostics](docs/V1_9_4_SAME_DATE_FRAGMENT_MERGING_AND_DIAGNOSTICS.md), the [v1.9.3 calibration date-key correction and report integrity](docs/V1_9_3_CALIBRATION_DATE_KEY_AND_REPORT_INTEGRITY.md), the [v1.9.2 Market Replay preflight and Windows test clarification](docs/V1_9_2_GUI_PREFLIGHT_AND_WINDOWS_TEST_CLARIFICATION.md), the [v1.9.1 Ruff F841 quality-gate correction](docs/V1_9_1_RUFF_F841_QUALITY_GATE_CORRECTION.md), the [v1.9.0 robust selection and validation release note](docs/V1_9_0_ROBUST_SELECTION_VALIDATION.md), and the [v1.8.0 continuous replay and execution-calibration release note](docs/V1_8_0_CONTINUOUS_REPLAY_AND_EXECUTION_CALIBRATION.md).
+### Exact analysis-wide parallel engine
+
+Version 2.1.0 prepares each retained Market Replay session once as compact,
+read-only NumPy arrays. Strategy price, valid bid/ask state, event flags, and
+ATR series are then shared with spawned worker processes through file-backed
+memory maps. Independent Stage 3 profiles, local refinement profiles, and
+outward search-boundary probes can therefore use multiple CPU cores without
+pickling or duplicating the full Python tick-object graph.
+
+Version 2.3 keeps that same compact replay store and process pool alive through
+the expensive recommendation-authorization work after Stage 3. Independent
+exact leave-one-day-out selector reruns, fixed-profile omissions,
+selection-aware bootstrap replicates, walk-forward folds, ATR bar-phase
+variants, and assumption-stress scenarios are now distributed across the same
+workers. One profile's chronological event loop remains serial, and nested
+process pools are prohibited.
+
+The GUI exposes **Profile-evaluation workers**. `Automatic` keeps inputs below
+50,000 retained rows on the existing reference evaluator; larger inputs use
+the compact engine, leave one logical processor free, and use a memory-aware
+automatic ceiling of up to 16 spawned workers. `1` explicitly uses exact compact single-process
+execution; `2` through `64` request a spawned process count. The terminal
+equivalent is `--ibrec-workers`. Worker count is an execution preference only:
+it is excluded from analytical identity, candidate ordering, bootstrap
+schedules, and report content. Any worker failure aborts analysis; profiles are
+never silently omitted.
+
+Version 2.2 adds exact effective-profile equivalence collapsing after ATR
+multiplication, clamp application, and two-decimal rounding. Only one proven
+equivalent representative is replayed; every nominal profile is restored
+before ranking, stable-region construction, boundary search, robustness
+validation, and reporting. Shared read-only effective-percentage and clamp-state
+arrays remove repeated arithmetic from Stage 3 refinement, while adaptive small
+batches improve process-pool load balancing for multi-million-row recordings.
+
+The performance engine also removes repeated tick-object method work from the hot
+path, calculates drawdown online in chronological order, replaces large
+per-second clamp-observation sets with exact counters, pre-normalizes session
+assumptions, and retains only aggregate candidate evidence during broad
+screening. These are calculation-preserving optimizations: the serial compact
+engine and spawned process engine are regression-tested against the original
+reference replay down to every profile/session result.
+
+Progress messages identify the active post-Stage-3 operation, worker mode,
+completed task count, total task count, and pending task count. Reaching 100%
+for an outward-boundary batch therefore no longer leaves the interface showing
+that completed operation while later robustness validation is still running.
+
+The Market Replay result remains a bounded paper-testing candidate, not a mathematical optimum or live-trading instruction. See the [v2.3.1 profile-identity and outward-probe correction](docs/V2_3_1_PROFILE_IDENTITY_AND_PROBE_FLOOR.md), the [v2.3.0 analysis-wide parallel validation release note](docs/V2_3_0_ANALYSIS_WIDE_PARALLEL_VALIDATION.md), the [v2.2.3 Pyright and resource hardening](docs/V2_2_3_PYRIGHT_AND_RESOURCE_HARDENING.md), the [v2.2.2 Ruff quality-gate correction](docs/V2_2_2_RUFF_QUALITY_GATE_CORRECTION.md), the [v2.2.1 deep performance audit](docs/V2_2_1_DEEP_PERFORMANCE_AUDIT.md), the [v2.2.0 exact refinement acceleration](docs/V2_2_0_EXACT_REFINEMENT_ACCELERATION.md), the [v2.1.1 Pyright ATR-provider typing correction](docs/V2_1_1_PYRIGHT_ATR_PROVIDER_TYPING_CORRECTION.md), and the [v2.1.0 exact parallel replay performance release note](docs/V2_1_0_EXACT_PARALLEL_REPLAY_PERFORMANCE.md).
 
 ## What the replay can and cannot do
 

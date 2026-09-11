@@ -8,10 +8,11 @@ import math
 import statistics
 import struct
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence, cast
 
 from .determinism import canonical_json_bytes
 from .ibrec import load_ibrec_set
@@ -27,6 +28,10 @@ from .market_replay_models import (
     MarketReplaySessionResult,
     MarketReplayTrade,
 )
+from .market_replay_optimization import (
+    AtrValueSeries as _AtrValueSeries,
+    lookup_effective_percentage_state,
+)
 from .market_replay_quality import assess_market_replay_session
 from .market_replay_validation import (
     BALANCED_SCORE_POLICY,
@@ -41,8 +46,11 @@ from .market_replay_validation import (
     score_policy_contract,
     score_sessions,
 )
-from .utils import canonical_session_date, percentile, timestamp_seconds
+from .utils import canonical_session_date, finite_float, percentile, timestamp_seconds
 from .version import APP_VERSION
+
+if TYPE_CHECKING:
+    from .market_replay_fast import PreparedReplayStore, ProfileBatchEvaluator
 
 
 class MarketReplayAnalysisError(RuntimeError):
@@ -51,7 +59,8 @@ class MarketReplayAnalysisError(RuntimeError):
 
 ProgressCallback = Callable[[str, int, int], None]
 AtrCacheKey = tuple[str, str, int, int, int]
-MARKET_REPLAY_ANALYSIS_CONTRACT_VERSION = 15
+ReplayPeriodTicks = Sequence[tuple[IbrecPeriod, Sequence[Any]]]
+MARKET_REPLAY_ANALYSIS_CONTRACT_VERSION = 16
 _CONTROL_PROFILE = AtrProfile(
     period=14,
     bar_seconds=60,
@@ -111,6 +120,12 @@ _CLAMP_COMPONENTS = (
     "protective_sell",
 )
 _CLAMP_STATES = ("min", "max", "raw", "zero")
+# BouncyBot treats a zero BUY-rebound or SELL-trail multiplier as an explicit
+# immediate market-order mode.  The initial-drop and minimum-profit multipliers
+# have a GUI minimum of 0.01 and cannot be entered as zero.
+_ZERO_CAPABLE_MULTIPLIERS = frozenset(
+    {"buy_rebound_multiplier", "sell_trail_multiplier"}
+)
 
 
 @dataclass(slots=True)
@@ -334,8 +349,8 @@ def market_replay_search_contract(config: MarketReplayConfig) -> dict[str, Any]:
         "buy_trail_cancel_seconds": normalized.buy_trail_cancel_seconds,
         "execution_quote_max_age_seconds": normalized.execution_quote_max_age_seconds,
         "input_recordings": {
-            "maximum": normalized.max_recordings,
-            "aggregate_row_limit": normalized.max_rows,
+            "recording_count_limit": None,
+            "aggregate_row_limit": None,
             "aggregate_input_byte_limit": normalized.max_input_bytes,
             "same_instrument_required": [
                 "symbol",
@@ -641,7 +656,7 @@ def _session_feed_evidence(
 
 
 def _precompute_atr(
-    ticks: list[IbrecTick],
+    ticks: Sequence[Any],
     period: int,
     bar_seconds: int,
     *,
@@ -711,23 +726,12 @@ def _precompute_atr(
     return output
 
 
-def _max_drawdown(equity_values: Iterable[float]) -> float:
-    peak = 0.0
-    maximum = 0.0
-    for equity in equity_values:
-        if not math.isfinite(equity) or equity <= 0:
-            continue
-        peak = max(peak, equity)
-        if peak > 0:
-            maximum = max(maximum, (peak - equity) / peak * 10_000.0)
-    return maximum
-
 
 def _simulate_session_stateful(
-    ticks: list[IbrecTick],
+    ticks: Sequence[Any],
     period: IbrecPeriod,
     profile: AtrProfile,
-    atr_values: list[float | None],
+    atr_values: _AtrValueSeries,
     min_tick: float,
     config: MarketReplayConfig | None = None,
     *,
@@ -737,6 +741,7 @@ def _simulate_session_stateful(
     continuity_chain_id: int = 1,
     continuity_broken_before: bool = False,
     continuity_break_reason: str = "",
+    config_is_normalized: bool = False,
 ) -> tuple[
     MarketReplaySessionResult,
     list[MarketReplayTrade],
@@ -746,7 +751,11 @@ def _simulate_session_stateful(
 
     if len(ticks) != len(atr_values):
         raise MarketReplayAnalysisError("Internal ATR/tick alignment failure.")
-    normalized = _normalized_replay_config(config)
+    normalized = (
+        config
+        if config is not None and config_is_normalized
+        else _normalized_replay_config(config)
+    )
     default_buy_cost = normalized.buy_execution_cost_bps_per_side
     default_sell_cost = normalized.sell_execution_cost_bps_per_side
     if default_buy_cost is None or default_sell_cost is None:
@@ -854,7 +863,28 @@ def _simulate_session_stateful(
     protective_exits_in_session = 0
     protective_cancellations_in_session = 0
     trades: list[MarketReplayTrade] = []
-    equity_values: list[float] = [session_start_equity]
+    session_equity_peak = 0.0
+    session_max_drawdown = 0.0
+
+    def record_equity(equity: float) -> None:
+        nonlocal session_equity_peak, session_max_drawdown
+        nonlocal chain_equity_peak, chain_max_drawdown
+        if not math.isfinite(equity) or equity <= 0:
+            return
+        session_equity_peak = max(session_equity_peak, equity)
+        if session_equity_peak > 0:
+            session_max_drawdown = max(
+                session_max_drawdown,
+                (session_equity_peak - equity) / session_equity_peak * 10_000.0,
+            )
+        chain_equity_peak = max(chain_equity_peak, equity)
+        if chain_equity_peak > 0:
+            chain_max_drawdown = max(
+                chain_max_drawdown,
+                (chain_equity_peak - equity) / chain_equity_peak * 10_000.0,
+            )
+
+    record_equity(session_start_equity)
     first_entry = ""
     last_exit = ""
     # A mark from the preceding close is valid for establishing the next
@@ -870,7 +900,9 @@ def _simulate_session_stateful(
         component: {state: 0 for state in _CLAMP_STATES}
         for component in _CLAMP_COMPONENTS
     }
-    clamp_component_seen_seconds: set[tuple[str, int]] = set()
+    clamp_component_last_second = {
+        component: -1 for component in _CLAMP_COMPONENTS
+    }
     issues: list[str] = []
     last_bid_update_ns: int | None = None
     last_ask_update_ns: int | None = None
@@ -878,9 +910,9 @@ def _simulate_session_stateful(
 
     def refresh_quote_times(tick: IbrecTick) -> None:
         nonlocal last_bid_update_ns, last_ask_update_ns
-        if tick.full_snapshot or "bid" in tick.changed_fields:
+        if tick.has_bid_event():
             last_bid_update_ns = tick.elapsed_ns if tick.valid_bid() is not None else None
-        if tick.full_snapshot or "ask" in tick.changed_fields:
+        if tick.has_ask_event():
             last_ask_update_ns = tick.elapsed_ns if tick.valid_ask() is not None else None
 
     def quote_is_fresh(tick: IbrecTick, updated_ns: int | None) -> bool:
@@ -903,10 +935,9 @@ def _simulate_session_stateful(
         # elapsed market time. Sample each strategy component at most once per
         # monotonic recorder second.
         decision_second = max(0, int(tick.elapsed_ns // 1_000_000_000))
-        sample_key = (component, decision_second)
-        if sample_key in clamp_component_seen_seconds:
+        if clamp_component_last_second.get(component, -1) == decision_second:
             return
-        clamp_component_seen_seconds.add(sample_key)
+        clamp_component_last_second[component] = decision_second
         if status in clamp_counts:
             clamp_counts[status] += 1
         if component in clamp_component_counts and status in _CLAMP_STATES:
@@ -942,7 +973,7 @@ def _simulate_session_stateful(
             equity = capital * (net_liquidation / buy_cost_basis)
             if first_mark_equity is None:
                 first_mark_equity = equity
-            equity_values.append(equity)
+            record_equity(equity)
 
     def protective_percentage(
         atr_pct: float | None,
@@ -1203,13 +1234,18 @@ def _simulate_session_stateful(
         assumed_quantity = 0
         active_trade = None
         cycle_number += 1
-        equity_values.append(capital)
+        record_equity(capital)
         return True
 
     for index, tick in enumerate(ticks):
         refresh_quote_times(tick)
         selected = tick.selected_price()
-        atr_pct = atr_values[index]
+        parsed_atr_pct = finite_float(atr_values[index])
+        atr_pct = (
+            parsed_atr_pct
+            if parsed_atr_pct is not None and parsed_atr_pct > 0
+            else None
+        )
         if atr_pct is not None:
             last_valid_atr_pct = atr_pct
 
@@ -1223,7 +1259,7 @@ def _simulate_session_stateful(
             )
             complete_buy(tick, buy_atr_pct)
             if stage == "BUY_FILL_PENDING":
-                equity_values.append(capital)
+                record_equity(capital)
             continue
         if stage == "SELL_FILL_PENDING":
             append_long_mark(tick)
@@ -1243,22 +1279,24 @@ def _simulate_session_stateful(
             if can_enter and atr_pct is not None:
                 anchor = selected
                 stage = "WAIT_DROP"
-                equity_values.append(capital)
+                record_equity(capital)
             continue
 
         if stage == "WAIT_DROP":
             if not can_enter or atr_pct is None:
-                equity_values.append(capital)
+                record_equity(capital)
                 continue
             anchor = selected if anchor is None else max(anchor, selected)
-            drop_pct, drop_state = _effective_percentage_state(
-                atr_pct,
+            drop_pct, drop_state = lookup_effective_percentage_state(
+                atr_values,
+                index,
                 profile.initial_drop_multiplier,
                 profile,
                 allow_zero=False,
             )
-            buy_pct, buy_state = _effective_percentage_state(
-                atr_pct,
+            buy_pct, buy_state = lookup_effective_percentage_state(
+                atr_values,
+                index,
                 profile.buy_rebound_multiplier,
                 profile,
                 allow_zero=True,
@@ -1266,11 +1304,11 @@ def _simulate_session_stateful(
             record_clamp("initial_drop", drop_state, tick)
             record_clamp("buy_rebound", buy_state, tick)
             if drop_pct is None or buy_pct is None:
-                equity_values.append(capital)
+                record_equity(capital)
                 continue
             trigger = anchor * (1.0 - drop_pct / 100.0)
             if selected > trigger:
-                equity_values.append(capital)
+                record_equity(capital)
                 continue
             buy_trail_pct = buy_pct
             if buy_pct <= 0:
@@ -1280,7 +1318,7 @@ def _simulate_session_stateful(
                     atr_pct if atr_pct is not None else last_valid_atr_pct
                 )
                 if not complete_buy(tick, buy_atr_pct):
-                    equity_values.append(capital)
+                    record_equity(capital)
             else:
                 reference_values = [
                     value
@@ -1301,7 +1339,7 @@ def _simulate_session_stateful(
                 buy_running_low = _valid(tick.last) or selected
                 buy_placed_sequence = tick.sequence
                 stage = "BUY_TRAIL"
-                equity_values.append(capital)
+                record_equity(capital)
             continue
 
         if stage == "BUY_TRAIL":
@@ -1314,20 +1352,20 @@ def _simulate_session_stateful(
                 issues.append(
                     "An unfilled BUY trailing setup was treated as cancelled at the standardized five-minute-before-close cutoff."
                 )
-                equity_values.append(capital)
+                record_equity(capital)
                 continue
             if tick.sequence <= buy_placed_sequence or not tick.has_last_event():
-                equity_values.append(capital)
+                record_equity(capital)
                 continue
             last = _valid(tick.last)
             if last is None or buy_trail_pct is None or buy_stop is None:
-                equity_values.append(capital)
+                record_equity(capital)
                 continue
             buy_running_low = last if buy_running_low is None else min(buy_running_low, last)
             calculated = buy_running_low * (1.0 + buy_trail_pct / 100.0)
             buy_stop = min(buy_stop, calculated)
             if last < buy_stop:
-                equity_values.append(capital)
+                record_equity(capital)
                 continue
             buy_fill_reference = last
             stage = "BUY_FILL_PENDING"
@@ -1335,7 +1373,7 @@ def _simulate_session_stateful(
                 atr_pct if atr_pct is not None else last_valid_atr_pct
             )
             if not complete_buy(tick, buy_atr_pct):
-                equity_values.append(capital)
+                record_equity(capital)
             continue
 
         if buy_price is None:
@@ -1376,14 +1414,16 @@ def _simulate_session_stateful(
         if stage == "HOLD":
             if atr_pct is None:
                 continue
-            profit_pct, profit_state = _effective_percentage_state(
-                atr_pct,
+            profit_pct, profit_state = lookup_effective_percentage_state(
+                atr_values,
+                index,
                 profile.minimum_profit_multiplier,
                 profile,
                 allow_zero=False,
             )
-            trail_pct, sell_state = _effective_percentage_state(
-                atr_pct,
+            trail_pct, sell_state = lookup_effective_percentage_state(
+                atr_values,
+                index,
                 profile.sell_trail_multiplier,
                 profile,
                 allow_zero=True,
@@ -1561,16 +1601,6 @@ def _simulate_session_stateful(
             else 0.0
             for state in _CLAMP_STATES
         }
-    session_max_drawdown = _max_drawdown(equity_values)
-    for equity in equity_values:
-        if not math.isfinite(equity) or equity <= 0:
-            continue
-        chain_equity_peak = max(chain_equity_peak, equity)
-        if chain_equity_peak > 0:
-            chain_max_drawdown = max(
-                chain_max_drawdown,
-                (chain_equity_peak - equity) / chain_equity_peak * 10_000.0,
-            )
     result = MarketReplaySessionResult(
         session_date=period.session_date,
         period_id=period.period_id,
@@ -1727,10 +1757,10 @@ def _simulate_session_stateful(
 
 
 def _simulate_session(
-    ticks: list[IbrecTick],
+    ticks: Sequence[Any],
     period: IbrecPeriod,
     profile: AtrProfile,
-    atr_values: list[float | None],
+    atr_values: _AtrValueSeries,
     min_tick: float,
     config: MarketReplayConfig | None = None,
     *,
@@ -1750,7 +1780,9 @@ def _simulate_session(
     return result, trades
 
 
-def _period_sort_key(item: tuple[IbrecPeriod, list[IbrecTick]]) -> tuple[Any, ...]:
+def _period_sort_key(
+    item: tuple[IbrecPeriod, Sequence[Any]],
+) -> tuple[Any, ...]:
     period, _ = item
     return (
         period.open_timestamp,
@@ -1774,18 +1806,19 @@ def _atr_cache_key(
     )
 
 
-def _evaluate_period_sequence(
-    recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+def _evaluate_period_sequence_core(
+    min_tick: float,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
     profile: AtrProfile,
     config: MarketReplayConfig,
-    atr_provider: Callable[[IbrecPeriod, list[IbrecTick]], list[float | None]],
+    atr_provider: Callable[[IbrecPeriod, Sequence[Any]], _AtrValueSeries],
     *,
     keep_details: bool,
+    config_is_normalized: bool = False,
 ) -> tuple[list[MarketReplaySessionResult], list[MarketReplayTrade]]:
     """Replay periods chronologically, carrying only provably continuous longs."""
 
-    normalized = config.normalized()
+    normalized = config if config_is_normalized else config.normalized()
     ordered = sorted(period_ticks, key=_period_sort_key)
     sessions: list[MarketReplaySessionResult] = []
     trades: list[MarketReplayTrade] = []
@@ -1817,7 +1850,7 @@ def _evaluate_period_sequence(
             period,
             profile,
             atr_provider(period, ticks),
-            recording.min_tick,
+            min_tick,
             normalized,
             keep_trades=keep_details,
             state=state,
@@ -1825,6 +1858,7 @@ def _evaluate_period_sequence(
             continuity_chain_id=chain_id,
             continuity_broken_before=broken_before,
             continuity_break_reason=break_reason,
+            config_is_normalized=True,
         )
         sessions.append(result)
         if keep_details:
@@ -1849,8 +1883,31 @@ def _evaluate_period_sequence(
     return sessions, trades
 
 
+def _evaluate_period_sequence(
+    recording: IbrecRecording,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
+    profile: AtrProfile,
+    config: MarketReplayConfig,
+    atr_provider: Callable[[IbrecPeriod, Sequence[Any]], _AtrValueSeries],
+    *,
+    keep_details: bool,
+) -> tuple[list[MarketReplaySessionResult], list[MarketReplayTrade]]:
+    """Compatibility wrapper around the compact-data-capable core."""
+
+    normalized = config.normalized()
+    return _evaluate_period_sequence_core(
+        recording.min_tick,
+        period_ticks,
+        profile,
+        normalized,
+        atr_provider,
+        keep_details=keep_details,
+        config_is_normalized=True,
+    )
+
+
 def _enrich_protective_trade_diagnostics(
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     sessions: list[MarketReplaySessionResult],
     trades: list[MarketReplayTrade],
 ) -> None:
@@ -1912,7 +1969,7 @@ def _enrich_protective_trade_diagnostics(
             bid
             for tick in observed_ticks
             if sell_timestamp < tick.timestamp < observation_end
-            and (tick.full_snapshot or "bid" in tick.changed_fields)
+            and tick.has_bid_event()
             and (bid := tick.valid_bid()) is not None
         ]
         if not future_bids:
@@ -2597,6 +2654,106 @@ def _score_delta_for_pairs(
     )
     delta = candidate.score - control.score
     return delta if math.isfinite(delta) else None
+
+
+def _fixed_leave_one_out_task_result(
+    recording: IbrecRecording,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
+    config: MarketReplayConfig,
+    omitted_day: str,
+    candidate_profile: AtrProfile,
+    control_profile: AtrProfile,
+) -> tuple[list[MarketReplaySessionResult], list[MarketReplaySessionResult]]:
+    """Replay fixed candidate/control profiles after removing one date."""
+
+    subset = [
+        item for item in period_ticks if item[0].session_date != omitted_day
+    ]
+    if not subset:
+        return [], []
+    _, candidate_sessions = _evaluate_profile_fresh(
+        recording,
+        cast(Any, subset),
+        candidate_profile,
+        config,
+    )
+    _, control_sessions = _evaluate_profile_fresh(
+        recording,
+        cast(Any, subset),
+        control_profile,
+        config,
+    )
+    return candidate_sessions, control_sessions
+
+
+def _exact_leave_one_out_results(
+    recording: IbrecRecording,
+    period_ticks: ReplayPeriodTicks,
+    config: MarketReplayConfig,
+    candidate_profile: AtrProfile,
+    control_profile: AtrProfile,
+    days: Sequence[str],
+    *,
+    batch_evaluator: ProfileBatchEvaluator | None,
+    progress: ProgressCallback | None,
+    progress_message: str,
+) -> dict[
+    str,
+    tuple[list[MarketReplaySessionResult], list[MarketReplaySessionResult]],
+]:
+    """Replay exact fixed-profile omissions in parallel where available."""
+
+    ordered_days = tuple(sorted(dict.fromkeys(str(day) for day in days)))
+    if not ordered_days:
+        return {}
+    if batch_evaluator is None:
+        _emit(progress, progress_message, 0, len(ordered_days))
+        output = {}
+        for index, omitted_day in enumerate(ordered_days, start=1):
+            output[omitted_day] = _fixed_leave_one_out_task_result(
+                recording,
+                period_ticks,
+                config,
+                omitted_day,
+                candidate_profile,
+                control_profile,
+            )
+            _emit(progress, progress_message, index, len(ordered_days))
+        return output
+
+    from .market_replay_fast import AnalysisWorkerTask
+
+    tasks = [
+        AnalysisWorkerTask(
+            task_id=f"fixed-leave-one-out:{candidate_profile.key()}:{omitted_day}",
+            kind="fixed_leave_one_out",
+            payload=(omitted_day, candidate_profile, control_profile),
+        )
+        for omitted_day in ordered_days
+    ]
+    values = batch_evaluator.run_analysis_tasks(
+        tasks,
+        serial_handler=lambda task: _fixed_leave_one_out_task_result(
+            recording,
+            period_ticks,
+            config,
+            str(task.payload[0]),
+            cast(AtrProfile, task.payload[1]),
+            cast(AtrProfile, task.payload[2]),
+        ),
+        progress=progress,
+        message=progress_message,
+    )
+    return {
+        omitted_day: cast(
+            tuple[
+                list[MarketReplaySessionResult],
+                list[MarketReplaySessionResult],
+            ],
+            value,
+        )
+        for omitted_day, value in zip(ordered_days, values)
+    }
 
 
 def _candidate_robustness(
@@ -3366,6 +3523,11 @@ def _boundary_extension_profiles(
         probe = replace(profile, **replacement)
         if probe.key() == profile.key() or probe.key() in {item.key() for item in probes}:
             return
+        # ``AtrProfile`` normalizes every key-rendered float to two decimals.
+        # Store the post-normalization value in the evidence row as well; a
+        # clamp probe such as 0.025 must be reported as the 0.03 profile that
+        # was actually replayed, not as its pre-normalization input.
+        normalized_value = getattr(probe, dimension)
         probes.append(probe)
         rows.append(
             {
@@ -3373,7 +3535,7 @@ def _boundary_extension_profiles(
                 "dimension": dimension,
                 "direction": direction,
                 "boundary_value": getattr(profile, dimension),
-                "probe_value": value,
+                "probe_value": normalized_value,
                 "probe_profile_key": probe.key(),
             }
         )
@@ -3400,10 +3562,26 @@ def _boundary_extension_profiles(
     ):
         values = sorted({float(getattr(item, dimension)) for item in same_window})
         current = float(getattr(profile, dimension))
-        if values and abs(current - values[0]) <= 1e-9 and current > 0.0:
-            add_probe(dimension, "lower", max(0.0, current - _REFINEMENT_STEP))
+        # BouncyBot accepts zero only for the BUY and SELL trailing
+        # multipliers, where it selects immediate market-style behavior.  The
+        # initial-drop and minimum-profit multipliers have a GUI minimum of
+        # 0.01 (see ``atr.normalize_atr_multiplier``).  An outward probe must
+        # stay inside the values a user can actually enter, otherwise a
+        # permanently clamp-bound profile that no one can reproduce enters the
+        # candidate tables and the near-best/Pareto analysis.
+        floor = 0.0 if dimension in _ZERO_CAPABLE_MULTIPLIERS else 0.01
+        if values and abs(current - values[0]) <= 1e-9 and current > floor + 1e-9:
+            add_probe(
+                dimension,
+                "lower",
+                round(max(floor, current - _REFINEMENT_STEP), 2),
+            )
         if values and abs(current - values[-1]) <= 1e-9:
-            add_probe(dimension, "upper", min(10.0, current + _REFINEMENT_STEP))
+            add_probe(
+                dimension,
+                "upper",
+                round(min(10.0, current + _REFINEMENT_STEP), 2),
+            )
 
     if center.clamp_min_rate_pct > 0.0:
         minimum_values = sorted({item.min_atr_pct for item in same_window})
@@ -3502,7 +3680,7 @@ def _stable_recommendation(
 
 def _evaluate_profile(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     atr_cache: dict[AtrCacheKey, list[float | None]],
     profile: AtrProfile,
     config: MarketReplayConfig,
@@ -3512,7 +3690,7 @@ def _evaluate_profile(
 ) -> tuple[MarketReplayCandidateSummary, list[MarketReplaySessionResult], list[MarketReplayTrade]]:
     def atr_provider(
         period: IbrecPeriod,
-        _ticks: list[IbrecTick],
+        _ticks: Sequence[Any],
     ) -> list[float | None]:
         return atr_cache[_atr_cache_key(period, profile.period, profile.bar_seconds)]
 
@@ -3538,14 +3716,14 @@ def _evaluate_profile(
 
 def _evaluate_profile_phase(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     profile: AtrProfile,
     phase_seconds: int,
     config: MarketReplayConfig,
 ) -> list[MarketReplaySessionResult]:
     def atr_provider(
         _period: IbrecPeriod,
-        ticks: list[IbrecTick],
+        ticks: Sequence[Any],
     ) -> list[float | None]:
         return _precompute_atr(
             ticks,
@@ -3569,30 +3747,96 @@ def _phase_values(bar_seconds: int) -> tuple[int, ...]:
     return tuple(range(0, max(_ATR_PHASE_STEP_SECONDS, bar_seconds), _ATR_PHASE_STEP_SECONDS))
 
 
+def _atr_phase_task_result(
+    recording: IbrecRecording,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
+    profile: AtrProfile,
+    phase_seconds: int,
+    config: MarketReplayConfig,
+) -> list[MarketReplaySessionResult]:
+    """Evaluate one profile/phase pair for parent or worker execution."""
+
+    return _evaluate_profile_phase(
+        recording,
+        cast(Any, period_ticks),
+        profile,
+        phase_seconds,
+        config,
+    )
+
+
 def _atr_phase_robustness(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     candidate: AtrProfile,
     control: AtrProfile,
     cache: dict[tuple[str, int], list[MarketReplaySessionResult]],
     config: MarketReplayConfig,
+    *,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
+    progress: ProgressCallback | None = None,
+    progress_message: str = "Post-Stage 3: ATR bar-phase stress",
 ) -> dict[str, Any]:
     """Stress candidate/control ATR buckets across plausible monotonic phases."""
 
-    def sessions(profile: AtrProfile, phase: int) -> list[MarketReplaySessionResult]:
-        key = (profile.key(), phase)
-        if key not in cache:
-            cache[key] = _evaluate_profile_phase(
-                recording,
-                period_ticks,
-                profile,
-                phase,
-                config,
-            )
-        return cache[key]
-
     candidate_phases = _phase_values(candidate.bar_seconds)
     control_phases = _phase_values(control.bar_seconds)
+    requests: list[tuple[AtrProfile, int]] = []
+    seen_requests: set[tuple[str, int]] = set()
+    for profile, phases in (
+        (candidate, candidate_phases),
+        (control, control_phases),
+    ):
+        for phase in phases:
+            key = (profile.key(), phase)
+            if key not in cache and key not in seen_requests:
+                seen_requests.add(key)
+                requests.append((profile, phase))
+    requests.sort(key=lambda item: (item[0].key(), item[1]))
+    if requests:
+        if batch_evaluator is None:
+            _emit(progress, progress_message, 0, len(requests))
+            for index, (profile, phase) in enumerate(requests, start=1):
+                cache[(profile.key(), phase)] = _atr_phase_task_result(
+                    recording,
+                    period_ticks,
+                    profile,
+                    phase,
+                    config,
+                )
+                _emit(progress, progress_message, index, len(requests))
+        else:
+            from .market_replay_fast import AnalysisWorkerTask
+
+            tasks = [
+                AnalysisWorkerTask(
+                    task_id=f"atr-phase:{profile.key()}:{phase}",
+                    kind="atr_phase",
+                    payload=(profile, phase),
+                )
+                for profile, phase in requests
+            ]
+            values = batch_evaluator.run_analysis_tasks(
+                tasks,
+                serial_handler=lambda task: _atr_phase_task_result(
+                    recording,
+                    period_ticks,
+                    cast(AtrProfile, task.payload[0]),
+                    int(task.payload[1]),
+                    config,
+                ),
+                progress=progress,
+                message=progress_message,
+            )
+            for (profile, phase), value in zip(requests, values):
+                cache[(profile.key(), phase)] = cast(
+                    list[MarketReplaySessionResult],
+                    value,
+                )
+
+    def sessions(profile: AtrProfile, phase: int) -> list[MarketReplaySessionResult]:
+        return cache[(profile.key(), phase)]
+
     cases: list[dict[str, Any]] = []
     session_adverse: dict[tuple[str, int], tuple[MarketReplaySessionResult, MarketReplaySessionResult, float]] = {}
     for candidate_phase in candidate_phases:
@@ -3655,12 +3899,13 @@ def _atr_phase_robustness(
 
 
 def _ensure_atr_windows(
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     atr_cache: dict[AtrCacheKey, list[float | None]],
     windows: Iterable[tuple[int, int]],
     *,
     progress: ProgressCallback | None,
     message: str,
+    prepared_store: PreparedReplayStore | None = None,
 ) -> None:
     missing = [
         (ibrec_period, atr_period, bar_seconds, ticks)
@@ -3673,17 +3918,34 @@ def _ensure_atr_windows(
         missing,
         start=1,
     ):
-        atr_cache[_atr_cache_key(ibrec_period, atr_period, bar_seconds)] = _precompute_atr(
-            ticks,
-            atr_period,
-            bar_seconds,
-        )
+        compact_ticks = None
+        source_ticks: Sequence[Any] = ticks
+        if prepared_store is not None:
+            compact_ticks = prepared_store.open_ticks(ibrec_period)
+            source_ticks = compact_ticks
+        try:
+            values = _precompute_atr(
+                source_ticks,
+                atr_period,
+                bar_seconds,
+            )
+        finally:
+            if compact_ticks is not None:
+                compact_ticks.close()
+        atr_cache[_atr_cache_key(ibrec_period, atr_period, bar_seconds)] = values
+        if prepared_store is not None:
+            prepared_store.persist_atr(
+                ibrec_period,
+                atr_period,
+                bar_seconds,
+                values,
+            )
         _emit(progress, message, index, total)
 
 
 def _evaluate_profiles(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     atr_cache: dict[AtrCacheKey, list[float | None]],
     profiles: Iterable[AtrProfile],
     summaries: dict[str, MarketReplayCandidateSummary],
@@ -3693,9 +3955,52 @@ def _evaluate_profiles(
     progress: ProgressCallback | None,
     message: str,
     summary_day_weights: dict[str, int] | None = None,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
 ) -> None:
-    pending = [profile for profile in profiles if profile.key() not in summaries]
+    # ``ProfileBatchEvaluator.evaluate`` refuses to run when two distinct
+    # profiles share one nominal key.  The reference path needs the identical
+    # guard: without it the second profile silently overwrites the first in
+    # ``summaries`` and the searched grid quietly shrinks, so the same input
+    # would either abort or under-search depending only on recording size and
+    # the configured worker count.
+    ordered_profiles = list(profiles)
+    keyed_profiles: dict[str, AtrProfile] = {}
+    for profile in ordered_profiles:
+        previous = keyed_profiles.setdefault(profile.key(), profile)
+        if previous != profile:
+            raise MarketReplayAnalysisError(
+                "Distinct ATR profiles produced the same nominal profile key: "
+                f"{profile.key()}."
+            )
+        existing = summaries.get(profile.key())
+        if existing is not None and existing.profile != profile:
+            raise MarketReplayAnalysisError(
+                "An existing Market Replay summary used the same nominal "
+                f"profile key for a different profile: {profile.key()}."
+            )
+    pending = [profile for profile in ordered_profiles if profile.key() not in summaries]
     total = len(pending)
+    if batch_evaluator is not None and pending:
+        def report_batch_progress(current: int, count: int) -> None:
+            _emit(
+                progress,
+                (
+                    f"{message} · {batch_evaluator.execution_label} · "
+                    f"{current}/{count} complete · {max(0, count - current)} pending"
+                ),
+                current,
+                count,
+            )
+
+        results = batch_evaluator.evaluate(
+            pending,
+            summary_day_weights=summary_day_weights,
+            progress=report_batch_progress,
+        )
+        for key, summary, sessions in results:
+            summaries[key] = summary
+            sessions_by_profile[key] = sessions
+        return
     for index, profile in enumerate(pending, start=1):
         summary, sessions, _ = _evaluate_profile(
             recording,
@@ -3780,7 +4085,7 @@ def _select_stage2_windows(
 
 def _select_windows(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     config: MarketReplayConfig,
     atr_cache: dict[AtrCacheKey, list[float | None]],
     summaries: dict[str, MarketReplayCandidateSummary],
@@ -3790,6 +4095,8 @@ def _select_windows(
     progress: ProgressCallback | None,
     summary_day_weights: dict[str, int] | None = None,
     base_profile: AtrProfile | None = None,
+    prepared_store: PreparedReplayStore | None = None,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
 ) -> tuple[
     list[tuple[int, int]],
     list[dict[str, Any]],
@@ -3809,6 +4116,7 @@ def _select_windows(
         stage1_windows,
         progress=progress,
         message="Stage 1 of 3: reconstructing bar-duration ATR windows",
+        prepared_store=prepared_store,
     )
     stage1_profiles = [
         profile
@@ -3831,6 +4139,7 @@ def _select_windows(
         progress=progress,
         message="Stage 1 of 3: comparing ATR bar durations",
         summary_day_weights=summary_day_weights,
+        batch_evaluator=batch_evaluator,
     )
     stage1_candidates = _best_window_candidates(stage1_profiles, summaries)
     selected_bars = _select_stage1_bars(stage1_candidates)
@@ -3859,6 +4168,7 @@ def _select_windows(
         all_stage2_windows,
         progress=progress,
         message="Stage 2 of 3: reconstructing ATR period candidates",
+        prepared_store=prepared_store,
     )
     all_stage2_profiles = [
         profile
@@ -3881,6 +4191,7 @@ def _select_windows(
         progress=progress,
         message="Stage 2 of 3: comparing ATR periods",
         summary_day_weights=summary_day_weights,
+        batch_evaluator=batch_evaluator,
     )
     stage2_profiles = [
         profile
@@ -4013,7 +4324,7 @@ def _protective_policy_center(
 
 def _select_protective_policy(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     config: MarketReplayConfig,
     atr_cache: dict[AtrCacheKey, list[float | None]],
     summaries: dict[str, MarketReplayCandidateSummary],
@@ -4022,6 +4333,8 @@ def _select_protective_policy(
     progress: ProgressCallback | None,
     summary_day_weights: dict[str, int] | None = None,
     collect_diagnostics: bool = False,
+    prepared_store: PreparedReplayStore | None = None,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
 ) -> tuple[list[AtrProfile], list[dict[str, Any]], str]:
     """Choose at most one protective policy for conditional ATR optimization.
 
@@ -4053,6 +4366,7 @@ def _select_protective_policy(
         [(control.period, control.bar_seconds)],
         progress=progress,
         message="Protective policy: reconstructing control ATR window",
+        prepared_store=prepared_store,
     )
     _evaluate_profiles(
         recording,
@@ -4065,6 +4379,7 @@ def _select_protective_policy(
         progress=progress,
         message="Protective policy: comparing disabled, manual, and ATR-adaptive trails",
         summary_day_weights=summary_day_weights,
+        batch_evaluator=batch_evaluator,
     )
     candidates = [summaries[profile.key()] for profile in profiles]
     disabled = summaries[control.key()]
@@ -4271,7 +4586,7 @@ def _select_protective_policy(
 
 def _run_bounded_selector(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     config: MarketReplayConfig,
     *,
     progress: ProgressCallback | None = None,
@@ -4403,24 +4718,13 @@ def _run_bounded_selector(
     )
 
 
-def _subset_candidate(
-    profile: AtrProfile,
-    sessions_by_profile: dict[str, list[MarketReplaySessionResult]],
-    omitted_day: str,
-    config: MarketReplayConfig,
-) -> MarketReplayCandidateSummary | None:
-    sessions = [
-        session
-        for session in sessions_by_profile.get(profile.key(), [])
-        if session.session_date != omitted_day
-    ]
-    return _summary(profile, sessions, config) if sessions else None
-
-
 def _leave_one_day_out_selection_rows(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     config: MarketReplayConfig,
+    *,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
+    progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     """Rerun the complete selector after removing each trading date.
 
@@ -4433,57 +4737,112 @@ def _leave_one_day_out_selection_rows(
     days = sorted({period.session_date for period, _ in period_ticks})
     if len(days) < 3:
         return []
-    rows: list[dict[str, Any]] = []
-    for omitted_day in days:
-        subset = [
-            item for item in period_ticks if item[0].session_date != omitted_day
-        ]
-        if not subset:
-            continue
-        run = _run_bounded_selector(recording, subset, config)
-        control_score = run.control.score
-        selected_score = run.selected.score
-        rows.append(
-            {
-                "omitted_trading_day": omitted_day,
-                "omitted_period_ids": sorted(
-                    period.period_id
-                    for period, _ in period_ticks
-                    if period.session_date == omitted_day
-                ),
-                "remaining_trading_days": len(
-                    {period.session_date for period, _ in subset}
-                ),
-                "selected_windows": [
-                    {"period": period, "bar_seconds": bar_seconds}
-                    for period, bar_seconds in run.selected_windows
-                ],
-                "available_stage3_windows": [
-                    {"period": period, "bar_seconds": bar_seconds}
-                    for period, bar_seconds in sorted(
-                        {
-                            (
-                                candidate.profile.period,
-                                candidate.profile.bar_seconds,
-                            )
-                            for candidate in run.candidates
-                        }
-                    )
-                ],
-                "selected_profile_key": run.selected.profile.key(),
-                "selected_period": run.selected.profile.period,
-                "selected_profile_bar_seconds": run.selected.profile.bar_seconds,
-                "selected_score": selected_score,
-                "selected_score_delta_vs_control": selected_score - control_score,
-                "selection_reason": run.reason,
-                "selection_mode": "exact_chronology_rebuilt",
-                "stage3_search_scope": (
-                    "Removed the date before replay, rebuilt overnight continuity, reran stages 1 and 2, "
-                    "rebuilt the complete stage-3 grid, and performed omission-specific local refinement."
-                ),
-            }
+    if batch_evaluator is None:
+        _emit(progress, "Post-Stage 3: exact leave-one-day-out selector reruns", 0, len(days))
+        rows = []
+        for index, omitted_day in enumerate(days, start=1):
+            rows.append(
+                _leave_one_day_out_selection_row(
+                    recording,
+                    period_ticks,
+                    config,
+                    omitted_day,
+                )
+            )
+            _emit(
+                progress,
+                "Post-Stage 3: exact leave-one-day-out selector reruns",
+                index,
+                len(days),
+            )
+        return rows
+
+    from .market_replay_fast import AnalysisWorkerTask
+
+    tasks = [
+        AnalysisWorkerTask(
+            task_id=f"leave-one-out-selector:{omitted_day}",
+            kind="leave_one_out_selector",
+            payload=(omitted_day,),
         )
-    return rows
+        for omitted_day in days
+    ]
+    return [
+        dict(row)
+        for row in batch_evaluator.run_analysis_tasks(
+            tasks,
+            serial_handler=lambda task: _leave_one_day_out_selection_row(
+                recording,
+                period_ticks,
+                config,
+                str(task.payload[0]),
+            ),
+            progress=progress,
+            message="Post-Stage 3: exact leave-one-day-out selector reruns",
+        )
+    ]
+
+
+def _leave_one_day_out_selection_row(
+    recording: IbrecRecording,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
+    config: MarketReplayConfig,
+    omitted_day: str,
+) -> dict[str, Any]:
+    """Return one exact selector result after removing ``omitted_day``."""
+
+    subset = [
+        item for item in period_ticks if item[0].session_date != omitted_day
+    ]
+    if not subset:
+        raise MarketReplayAnalysisError(
+            f"Removing {omitted_day} left no Market Replay periods."
+        )
+    run = _run_bounded_selector(
+        recording,
+        cast(Any, subset),
+        config,
+    )
+    control_score = run.control.score
+    selected_score = run.selected.score
+    return {
+        "omitted_trading_day": omitted_day,
+        "omitted_period_ids": sorted(
+            period.period_id
+            for period, _ in period_ticks
+            if period.session_date == omitted_day
+        ),
+        "remaining_trading_days": len(
+            {period.session_date for period, _ in subset}
+        ),
+        "selected_windows": [
+            {"period": period, "bar_seconds": bar_seconds}
+            for period, bar_seconds in run.selected_windows
+        ],
+        "available_stage3_windows": [
+            {"period": period, "bar_seconds": bar_seconds}
+            for period, bar_seconds in sorted(
+                {
+                    (
+                        candidate.profile.period,
+                        candidate.profile.bar_seconds,
+                    )
+                    for candidate in run.candidates
+                }
+            )
+        ],
+        "selected_profile_key": run.selected.profile.key(),
+        "selected_period": run.selected.profile.period,
+        "selected_profile_bar_seconds": run.selected.profile.bar_seconds,
+        "selected_score": selected_score,
+        "selected_score_delta_vs_control": selected_score - control_score,
+        "selection_reason": run.reason,
+        "selection_mode": "exact_chronology_rebuilt",
+        "stage3_search_scope": (
+            "Removed the date before replay, rebuilt overnight continuity, reran stages 1 and 2, "
+            "rebuilt the complete stage-3 grid, and performed omission-specific local refinement."
+        ),
+    }
 
 
 def _selection_stability(
@@ -4519,7 +4878,7 @@ def _selection_stability(
 
 def _evaluate_profile_fresh(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     profile: AtrProfile,
     config: MarketReplayConfig,
 ) -> tuple[MarketReplayCandidateSummary, list[MarketReplaySessionResult]]:
@@ -4764,11 +5123,116 @@ def _moving_block_robustness(
     }
 
 
+def _walk_forward_fold_row(
+    recording: IbrecRecording,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
+    config: MarketReplayConfig,
+    fold_number: int,
+    training_days: tuple[str, ...],
+    validation_days: tuple[str, ...],
+    candidate_profile: AtrProfile,
+) -> dict[str, Any]:
+    """Run one exact chronological walk-forward fold."""
+
+    training_set = set(training_days)
+    validation_set = set(validation_days)
+    training_ticks = [
+        item for item in period_ticks if item[0].session_date in training_set
+    ]
+    prefix_set = training_set | validation_set
+    prefix_ticks = [
+        item for item in period_ticks if item[0].session_date in prefix_set
+    ]
+    if not training_ticks or not prefix_ticks:
+        raise MarketReplayAnalysisError(
+            f"Walk-forward fold {fold_number} did not retain its required periods."
+        )
+    selector = _run_bounded_selector(
+        recording,
+        cast(Any, training_ticks),
+        config,
+    )
+    control_profile = _control_profile(config)
+    _, selected_sessions = _evaluate_profile_fresh(
+        recording,
+        cast(Any, prefix_ticks),
+        selector.selected.profile,
+        config,
+    )
+    _, control_sessions = _evaluate_profile_fresh(
+        recording,
+        cast(Any, prefix_ticks),
+        control_profile,
+        config,
+    )
+    _, fixed_candidate_sessions = _evaluate_profile_fresh(
+        recording,
+        cast(Any, prefix_ticks),
+        candidate_profile,
+        config,
+    )
+    selected_validation = _rebase_validation_drawdown(
+        [
+            session
+            for session in selected_sessions
+            if session.session_date in validation_set
+        ]
+    )
+    control_validation = _rebase_validation_drawdown(
+        [
+            session
+            for session in control_sessions
+            if session.session_date in validation_set
+        ]
+    )
+    fixed_validation = _rebase_validation_drawdown(
+        [
+            session
+            for session in fixed_candidate_sessions
+            if session.session_date in validation_set
+        ]
+    )
+    selected_delta = _score_delta_for_pairs(
+        selector.selected.profile,
+        control_profile,
+        _paired_session_list(selected_validation, control_validation),
+        config,
+    )
+    fixed_delta = _score_delta_for_pairs(
+        candidate_profile,
+        control_profile,
+        _paired_session_list(fixed_validation, control_validation),
+        config,
+    )
+    return {
+        "fold": fold_number,
+        "training_start": training_days[0],
+        "training_end": training_days[-1],
+        "training_days": len(training_days),
+        "validation_start": validation_days[0],
+        "validation_end": validation_days[-1],
+        "validation_days": len(validation_days),
+        "selected_profile_key": selector.selected.profile.key(),
+        "selected_period": selector.selected.profile.period,
+        "selected_bar_seconds": selector.selected.profile.bar_seconds,
+        "selected_validation_delta": selected_delta,
+        "fixed_candidate_validation_delta": fixed_delta,
+        "same_atr_window_as_final_candidate": (
+            selector.selected.profile.period == candidate_profile.period
+            and selector.selected.profile.bar_seconds == candidate_profile.bar_seconds
+        ),
+    }
+
+
 def _walk_forward_validation(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     candidate_profile: AtrProfile,
     config: MarketReplayConfig,
+    *,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
+    progress: ProgressCallback | None = None,
+    progress_message: str = "Post-Stage 3: chronological walk-forward folds",
 ) -> dict[str, Any]:
     """Select on earlier sessions and evaluate frozen profiles on later sessions."""
 
@@ -4778,88 +5242,59 @@ def _walk_forward_validation(
         minimum_training_days=_WALK_FORWARD_MIN_TRAINING_DAYS,
         validation_days=_WALK_FORWARD_VALIDATION_DAYS,
     )
-    rows: list[dict[str, Any]] = []
-    control_profile = _control_profile(config)
-    for fold_number, (training_days, validation_days) in enumerate(folds, start=1):
-        training_set = set(training_days)
-        validation_set = set(validation_days)
-        training_ticks = [
-            item for item in period_ticks if item[0].session_date in training_set
-        ]
-        prefix_set = training_set | validation_set
-        prefix_ticks = [
-            item for item in period_ticks if item[0].session_date in prefix_set
-        ]
-        selector = _run_bounded_selector(recording, training_ticks, config)
-        _, selected_sessions = _evaluate_profile_fresh(
-            recording,
-            prefix_ticks,
-            selector.selected.profile,
-            config,
-        )
-        _, control_sessions = _evaluate_profile_fresh(
-            recording,
-            prefix_ticks,
-            control_profile,
-            config,
-        )
-        _, fixed_candidate_sessions = _evaluate_profile_fresh(
-            recording,
-            prefix_ticks,
-            candidate_profile,
-            config,
-        )
-        selected_validation = [
-            session
-            for session in selected_sessions
-            if session.session_date in validation_set
-        ]
-        control_validation = [
-            session
-            for session in control_sessions
-            if session.session_date in validation_set
-        ]
-        fixed_validation = [
-            session
-            for session in fixed_candidate_sessions
-            if session.session_date in validation_set
-        ]
-        selected_validation = _rebase_validation_drawdown(selected_validation)
-        control_validation = _rebase_validation_drawdown(control_validation)
-        fixed_validation = _rebase_validation_drawdown(fixed_validation)
-        selected_delta = _score_delta_for_pairs(
-            selector.selected.profile,
-            control_profile,
-            _paired_session_list(selected_validation, control_validation),
-            config,
-        )
-        fixed_delta = _score_delta_for_pairs(
-            candidate_profile,
-            control_profile,
-            _paired_session_list(fixed_validation, control_validation),
-            config,
-        )
-        rows.append(
-            {
-                "fold": fold_number,
-                "training_start": training_days[0],
-                "training_end": training_days[-1],
-                "training_days": len(training_days),
-                "validation_start": validation_days[0],
-                "validation_end": validation_days[-1],
-                "validation_days": len(validation_days),
-                "selected_profile_key": selector.selected.profile.key(),
-                "selected_period": selector.selected.profile.period,
-                "selected_bar_seconds": selector.selected.profile.bar_seconds,
-                "selected_validation_delta": selected_delta,
-                "fixed_candidate_validation_delta": fixed_delta,
-                "same_atr_window_as_final_candidate": (
-                    selector.selected.profile.period == candidate_profile.period
-                    and selector.selected.profile.bar_seconds
-                    == candidate_profile.bar_seconds
+    if batch_evaluator is None:
+        _emit(progress, progress_message, 0, len(folds))
+        rows = []
+        for fold_number, (training_days, validation_days) in enumerate(folds, start=1):
+            rows.append(
+                _walk_forward_fold_row(
+                    recording,
+                    period_ticks,
+                    config,
+                    fold_number,
+                    tuple(training_days),
+                    tuple(validation_days),
+                    candidate_profile,
+                )
+            )
+            _emit(progress, progress_message, fold_number, len(folds))
+    else:
+        from .market_replay_fast import AnalysisWorkerTask
+
+        tasks = [
+            AnalysisWorkerTask(
+                task_id=f"walk-forward:{fold_number:04d}",
+                kind="walk_forward",
+                payload=(
+                    fold_number,
+                    tuple(training_days),
+                    tuple(validation_days),
+                    candidate_profile,
                 ),
-            }
-        )
+            )
+            for fold_number, (training_days, validation_days) in enumerate(
+                folds,
+                start=1,
+            )
+        ]
+        rows = [
+            dict(row)
+            for row in batch_evaluator.run_analysis_tasks(
+                tasks,
+                serial_handler=lambda task: _walk_forward_fold_row(
+                    recording,
+                    period_ticks,
+                    config,
+                    int(task.payload[0]),
+                    tuple(str(day) for day in cast(Sequence[Any], task.payload[1])),
+                    tuple(str(day) for day in cast(Sequence[Any], task.payload[2])),
+                    cast(AtrProfile, task.payload[3]),
+                ),
+                progress=progress,
+                message=progress_message,
+            )
+        ]
+
     selected_values = [
         float(row["selected_validation_delta"])
         for row in rows
@@ -4929,9 +5364,81 @@ def _walk_forward_validation(
     }
 
 
+def _selection_aware_bootstrap_replicate_row(
+    recording: IbrecRecording,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
+    config: MarketReplayConfig,
+    replicate: int,
+    indices: tuple[int, ...],
+    units: tuple[tuple[str, ...], ...],
+    candidate_profile: AtrProfile,
+) -> dict[str, Any] | None:
+    """Run one complete selector bootstrap replicate and score its OOB data."""
+
+    counts: dict[int, int] = defaultdict(int)
+    for index in indices:
+        counts[index] += 1
+    oob_indices = [index for index in range(len(units)) if index not in counts]
+    if not oob_indices:
+        return None
+    day_weights: dict[str, int] = defaultdict(int)
+    for index, count in counts.items():
+        for day in units[index]:
+            day_weights[day] += count
+    training_days = set(day_weights)
+    oob_days = {day for index in oob_indices for day in units[index]}
+    training_ticks = [
+        item for item in period_ticks if item[0].session_date in training_days
+    ]
+    oob_ticks = [
+        item for item in period_ticks if item[0].session_date in oob_days
+    ]
+    if not training_ticks or not oob_ticks:
+        return None
+    selector = _run_bounded_selector(
+        recording,
+        cast(Any, training_ticks),
+        config,
+        day_weights=dict(day_weights),
+    )
+    control_profile = _control_profile(config)
+    _, selected_oob = _evaluate_profile_fresh(
+        recording,
+        cast(Any, oob_ticks),
+        selector.selected.profile,
+        config,
+    )
+    _, control_oob = _evaluate_profile_fresh(
+        recording,
+        cast(Any, oob_ticks),
+        control_profile,
+        config,
+    )
+    delta = _score_delta_for_pairs(
+        selector.selected.profile,
+        control_profile,
+        _paired_session_list(selected_oob, control_oob),
+        config,
+    )
+    return {
+        "replicate": replicate,
+        "training_units": len(counts),
+        "out_of_bag_units": len(oob_indices),
+        "selected_profile_key": selector.selected.profile.key(),
+        "selected_period": selector.selected.profile.period,
+        "selected_bar_seconds": selector.selected.profile.bar_seconds,
+        "selected_control": selector.selected.profile.key() == control_profile.key(),
+        "same_atr_window_as_final_candidate": (
+            selector.selected.profile.period == candidate_profile.period
+            and selector.selected.profile.bar_seconds == candidate_profile.bar_seconds
+        ),
+        "out_of_bag_score_delta": delta,
+    }
+
+
 def _selection_aware_bootstrap(
     recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
+    period_ticks: ReplayPeriodTicks,
     candidate_profile: AtrProfile,
     candidate_sessions: list[MarketReplaySessionResult],
     control_sessions: list[MarketReplaySessionResult],
@@ -4941,6 +5448,9 @@ def _selection_aware_bootstrap(
     dependency_session_groups: Iterable[
         Iterable[MarketReplaySessionResult]
     ] | None = None,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
+    progress: ProgressCallback | None = None,
+    progress_message: str = "Post-Stage 3: selection-aware bootstrap replicates",
 ) -> dict[str, Any]:
     """Rerun selection on bootstrap training bags and score on out-of-bag units."""
 
@@ -4964,82 +5474,64 @@ def _selection_aware_bootstrap(
             ],
             "rows": [],
         }
-    rows: list[dict[str, Any]] = []
-    control_profile = _control_profile(config)
-    for replicate, indices in enumerate(
-        _deterministic_bootstrap_indices(
-            seed,
-            replicates=_SELECTION_BOOTSTRAP_REPLICATES,
-            draws=len(units),
-            size=len(units),
-        ),
-        start=1,
-    ):
-        counts: dict[int, int] = defaultdict(int)
-        for index in indices:
-            counts[index] += 1
-        oob_indices = [index for index in range(len(units)) if index not in counts]
-        if not oob_indices:
-            continue
-        day_weights: dict[str, int] = defaultdict(int)
-        for index, count in counts.items():
-            for day in units[index]:
-                day_weights[day] += count
-        training_days = set(day_weights)
-        oob_days = {
-            day for index in oob_indices for day in units[index]
-        }
-        training_ticks = [
-            item for item in period_ticks if item[0].session_date in training_days
+    unit_tuple = tuple(tuple(str(day) for day in unit) for unit in units)
+    replicate_specs = list(
+        enumerate(
+            _deterministic_bootstrap_indices(
+                seed,
+                replicates=_SELECTION_BOOTSTRAP_REPLICATES,
+                draws=len(units),
+                size=len(units),
+            ),
+            start=1,
+        )
+    )
+    if batch_evaluator is None:
+        _emit(progress, progress_message, 0, len(replicate_specs))
+        rows = []
+        for completed, (replicate, indices) in enumerate(replicate_specs, start=1):
+            row = _selection_aware_bootstrap_replicate_row(
+                recording,
+                period_ticks,
+                config,
+                replicate,
+                tuple(indices),
+                unit_tuple,
+                candidate_profile,
+            )
+            if row is not None:
+                rows.append(row)
+            _emit(progress, progress_message, completed, len(replicate_specs))
+    else:
+        from .market_replay_fast import AnalysisWorkerTask
+
+        tasks = [
+            AnalysisWorkerTask(
+                task_id=f"selection-bootstrap:{replicate:04d}",
+                kind="selection_bootstrap",
+                payload=(replicate, tuple(indices), unit_tuple, candidate_profile),
+            )
+            for replicate, indices in replicate_specs
         ]
-        oob_ticks = [
-            item for item in period_ticks if item[0].session_date in oob_days
-        ]
-        if not training_ticks or not oob_ticks:
-            continue
-        selector = _run_bounded_selector(
-            recording,
-            training_ticks,
-            config,
-            day_weights=dict(day_weights),
-        )
-        _, selected_oob = _evaluate_profile_fresh(
-            recording,
-            oob_ticks,
-            selector.selected.profile,
-            config,
-        )
-        _, control_oob = _evaluate_profile_fresh(
-            recording,
-            oob_ticks,
-            control_profile,
-            config,
-        )
-        delta = _score_delta_for_pairs(
-            selector.selected.profile,
-            control_profile,
-            _paired_session_list(selected_oob, control_oob),
-            config,
-        )
-        rows.append(
-            {
-                "replicate": replicate,
-                "training_units": len(counts),
-                "out_of_bag_units": len(oob_indices),
-                "selected_profile_key": selector.selected.profile.key(),
-                "selected_period": selector.selected.profile.period,
-                "selected_bar_seconds": selector.selected.profile.bar_seconds,
-                "selected_control": (
-                    selector.selected.profile.key() == control_profile.key()
+        values = batch_evaluator.run_analysis_tasks(
+            tasks,
+            serial_handler=lambda task: _selection_aware_bootstrap_replicate_row(
+                recording,
+                period_ticks,
+                config,
+                int(task.payload[0]),
+                tuple(int(index) for index in cast(Sequence[Any], task.payload[1])),
+                tuple(
+                    tuple(str(day) for day in cast(Sequence[Any], unit))
+                    for unit in cast(Sequence[Any], task.payload[2])
                 ),
-                "same_atr_window_as_final_candidate": (
-                    selector.selected.profile.period == candidate_profile.period
-                    and selector.selected.profile.bar_seconds
-                    == candidate_profile.bar_seconds
-                ),
-                "out_of_bag_score_delta": delta,
-            }
+                cast(AtrProfile, task.payload[3]),
+            ),
+            progress=progress,
+            message=progress_message,
         )
+        rows = [dict(value) for value in values if value is not None]
+
     values = [
         float(row["out_of_bag_score_delta"])
         for row in rows
@@ -5091,24 +5583,22 @@ def _selection_aware_bootstrap(
     }
 
 
-def _assumption_stress_validation(
-    recording: IbrecRecording,
-    period_ticks: list[tuple[IbrecPeriod, list[IbrecTick]]],
-    candidate_profile: AtrProfile,
-    control_profile: AtrProfile,
+def _assumption_stress_variants(
     config: MarketReplayConfig,
     *,
     buy_cost_p90: float | None,
     sell_cost_p90: float | None,
-) -> dict[str, Any]:
-    """Replay fixed candidate/control profiles under deterministic assumption stress."""
+) -> list[tuple[str, MarketReplayConfig]]:
+    """Return deterministic execution, liquidity, and timing stress variants."""
 
     normalized = config.normalized()
     base_buy = normalized.buy_execution_cost_bps_per_side
     base_sell = normalized.sell_execution_cost_bps_per_side
     if base_buy is None or base_sell is None:
-        raise MarketReplayAnalysisError("Side-specific execution reserves were not normalized.")
-    variants: list[tuple[str, MarketReplayConfig]] = [
+        raise MarketReplayAnalysisError(
+            "Side-specific execution reserves were not normalized."
+        )
+    return [
         (
             "execution_cost_150pct",
             replace(
@@ -5125,8 +5615,14 @@ def _assumption_stress_validation(
             "execution_cost_p90",
             replace(
                 normalized,
-                buy_execution_cost_bps_per_side=max(base_buy, buy_cost_p90 or base_buy),
-                sell_execution_cost_bps_per_side=max(base_sell, sell_cost_p90 or base_sell),
+                buy_execution_cost_bps_per_side=max(
+                    base_buy,
+                    buy_cost_p90 or base_buy,
+                ),
+                sell_execution_cost_bps_per_side=max(
+                    base_sell,
+                    sell_cost_p90 or base_sell,
+                ),
                 execution_cost_overrides=(),
             ),
         ),
@@ -5181,49 +5677,121 @@ def _assumption_stress_validation(
             replace(normalized, entry_cutoff_seconds=30 * 60),
         ),
     ]
-    rows: list[dict[str, Any]] = []
-    for key, variant in variants:
-        candidate_summary, candidate_sessions = _evaluate_profile_fresh(
-            recording,
-            period_ticks,
-            candidate_profile,
-            variant,
-        )
-        control_summary, control_sessions = _evaluate_profile_fresh(
-            recording,
-            period_ticks,
-            control_profile,
-            variant,
-        )
-        delta = _score_delta_for_pairs(
-            candidate_profile,
-            control_profile,
-            _paired_session_list(candidate_sessions, control_sessions),
-            variant,
-        )
-        passed = (
-            delta is not None
-            and delta > 0.0
-            and candidate_summary.unmarked_open_position_sessions == 0
-            and candidate_summary.right_censored_sessions
-            <= control_summary.right_censored_sessions
-        )
-        rows.append(
-            {
-                "stress_key": key,
-                "candidate_score": candidate_summary.score,
-                "control_score": control_summary.score,
-                "score_delta": delta,
-                "candidate_right_censored_sessions": (
-                    candidate_summary.right_censored_sessions
+
+
+def _assumption_stress_scenario_row(
+    recording: IbrecRecording,
+    period_ticks: Sequence[tuple[IbrecPeriod, Sequence[Any]]],
+    stress_key: str,
+    variant: MarketReplayConfig,
+    candidate_profile: AtrProfile,
+    control_profile: AtrProfile,
+) -> dict[str, Any]:
+    """Evaluate one candidate/control assumption-stress scenario."""
+
+    candidate_summary, candidate_sessions = _evaluate_profile_fresh(
+        recording,
+        cast(Any, period_ticks),
+        candidate_profile,
+        variant,
+    )
+    control_summary, control_sessions = _evaluate_profile_fresh(
+        recording,
+        cast(Any, period_ticks),
+        control_profile,
+        variant,
+    )
+    delta = _score_delta_for_pairs(
+        candidate_profile,
+        control_profile,
+        _paired_session_list(candidate_sessions, control_sessions),
+        variant,
+    )
+    passed = (
+        delta is not None
+        and delta > 0.0
+        and candidate_summary.unmarked_open_position_sessions == 0
+        and candidate_summary.right_censored_sessions
+        <= control_summary.right_censored_sessions
+    )
+    return {
+        "stress_key": stress_key,
+        "candidate_score": candidate_summary.score,
+        "control_score": control_summary.score,
+        "score_delta": delta,
+        "candidate_right_censored_sessions": (
+            candidate_summary.right_censored_sessions
+        ),
+        "control_right_censored_sessions": control_summary.right_censored_sessions,
+        "candidate_unmarked_open_positions": (
+            candidate_summary.unmarked_open_position_sessions
+        ),
+        "passed": passed,
+    }
+
+
+def _assumption_stress_validation(
+    recording: IbrecRecording,
+    period_ticks: ReplayPeriodTicks,
+    candidate_profile: AtrProfile,
+    control_profile: AtrProfile,
+    config: MarketReplayConfig,
+    *,
+    buy_cost_p90: float | None,
+    sell_cost_p90: float | None,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
+    progress: ProgressCallback | None = None,
+    progress_message: str = "Post-Stage 3: assumption-stress replays",
+) -> dict[str, Any]:
+    """Replay fixed candidate/control profiles under deterministic assumption stress."""
+
+    variants = _assumption_stress_variants(
+        config,
+        buy_cost_p90=buy_cost_p90,
+        sell_cost_p90=sell_cost_p90,
+    )
+    if batch_evaluator is None:
+        _emit(progress, progress_message, 0, len(variants))
+        rows = []
+        for index, (key, variant) in enumerate(variants, start=1):
+            rows.append(
+                _assumption_stress_scenario_row(
+                    recording,
+                    period_ticks,
+                    key,
+                    variant,
+                    candidate_profile,
+                    control_profile,
+                )
+            )
+            _emit(progress, progress_message, index, len(variants))
+    else:
+        from .market_replay_fast import AnalysisWorkerTask
+
+        tasks = [
+            AnalysisWorkerTask(
+                task_id=f"assumption-stress:{key}",
+                kind="assumption_stress",
+                payload=(key, variant, candidate_profile, control_profile),
+            )
+            for key, variant in variants
+        ]
+        rows = [
+            dict(row)
+            for row in batch_evaluator.run_analysis_tasks(
+                tasks,
+                serial_handler=lambda task: _assumption_stress_scenario_row(
+                    recording,
+                    period_ticks,
+                    str(task.payload[0]),
+                    cast(MarketReplayConfig, task.payload[1]),
+                    cast(AtrProfile, task.payload[2]),
+                    cast(AtrProfile, task.payload[3]),
                 ),
-                "control_right_censored_sessions": control_summary.right_censored_sessions,
-                "candidate_unmarked_open_positions": (
-                    candidate_summary.unmarked_open_position_sessions
-                ),
-                "passed": passed,
-            }
-        )
+                progress=progress,
+                message=progress_message,
+            )
+        ]
     return {
         "evaluated": True,
         "passed": all(row["passed"] for row in rows),
@@ -5234,6 +5802,7 @@ def _assumption_stress_validation(
             if not row["passed"]
         ],
     }
+
 
 def _copy_selection_evidence(
     source: MarketReplayCandidateSummary,
@@ -5336,6 +5905,140 @@ def _copy_selection_evidence(
     target.protective_policy_stable = source.protective_policy_stable
 
 
+def _run_stage3_search(
+    recording: IbrecRecording,
+    period_ticks: ReplayPeriodTicks,
+    atr_cache: dict[AtrCacheKey, list[float | None]],
+    summaries: dict[str, MarketReplayCandidateSummary],
+    sessions_by_profile: dict[str, list[MarketReplaySessionResult]],
+    config: MarketReplayConfig,
+    policy_window_sets: list[tuple[AtrProfile, list[tuple[int, int]]]],
+    *,
+    robustness_possible: bool,
+    trading_day_count: int,
+    progress: ProgressCallback | None,
+    prepared_store: PreparedReplayStore | None = None,
+    batch_evaluator: ProfileBatchEvaluator | None = None,
+) -> tuple[set[str], list[MarketReplayCandidateSummary]]:
+    """Run Stage 3 and outward probes through the analysis-wide evaluator."""
+
+    coarse_profiles = _coarse_profiles_for_policy_windows(
+        config,
+        policy_window_sets,
+        search_clamps=robustness_possible,
+    )
+    stage3_windows = {
+        (profile.period, profile.bar_seconds) for profile in coarse_profiles
+    }
+    if prepared_store is not None:
+        prepared_store.persist_atr_cache(atr_cache, windows=stage3_windows)
+
+    _evaluate_profiles(
+        recording,
+        period_ticks,
+        atr_cache,
+        coarse_profiles,
+        summaries,
+        sessions_by_profile,
+        config,
+        progress=progress,
+        message="Stage 3 of 3: evaluating multiplier profiles",
+        batch_evaluator=batch_evaluator,
+    )
+    stage3_keys = {profile.key() for profile in coarse_profiles}
+    coarse_candidates = [summaries[key] for key in sorted(stage3_keys)]
+    seeds = _refinement_seeds(coarse_candidates) if robustness_possible else []
+    refined_profiles = (
+        [
+            profile
+            for profile in _refined_profiles(seeds, config)
+            if profile.key() not in stage3_keys
+        ]
+        if robustness_possible
+        else []
+    )
+    if refined_profiles:
+        _evaluate_profiles(
+            recording,
+            period_ticks,
+            atr_cache,
+            refined_profiles,
+            summaries,
+            sessions_by_profile,
+            config,
+            progress=progress,
+            message="Stage 3 of 3: refining multiplier profiles",
+            batch_evaluator=batch_evaluator,
+        )
+    stage3_keys.update(profile.key() for profile in refined_profiles)
+    candidates = sorted(
+        (summaries[key] for key in stage3_keys),
+        key=_candidate_sort_key,
+    )
+
+    # A stable region that touches the tested parameter boundary may simply be
+    # truncated by the grid. The boundary decision remains serial; only the
+    # independent probe replays use the persistent compact/parallel evaluator.
+    if robustness_possible:
+        for extension_round in range(2):
+            for candidate in candidates:
+                candidate.stable_region_id = ""
+                candidate.stable_region_size = 0
+                candidate.stable_region_center = False
+                candidate.near_best = False
+                candidate.evidence_stable = False
+            extension_centers = _stable_region_centers(
+                candidates,
+                sessions=trading_day_count,
+            )
+            outward_profiles: dict[str, AtrProfile] = {}
+            for center, _ in extension_centers:
+                probes, _ = _boundary_extension_profiles(center, candidates)
+                for profile in probes:
+                    if profile.key() not in summaries:
+                        outward_profiles[profile.key()] = profile
+            if not outward_profiles:
+                break
+            _ensure_atr_windows(
+                period_ticks,
+                atr_cache,
+                sorted(
+                    {
+                        (profile.period, profile.bar_seconds)
+                        for profile in outward_profiles.values()
+                    }
+                ),
+                progress=progress,
+                message=(
+                    "Extending truncated search boundaries, round "
+                    f"{extension_round + 1}"
+                ),
+                prepared_store=prepared_store,
+            )
+            _evaluate_profiles(
+                recording,
+                period_ticks,
+                atr_cache,
+                list(outward_profiles.values()),
+                summaries,
+                sessions_by_profile,
+                config,
+                progress=progress,
+                message=(
+                    "Evaluating outward search-boundary probes, round "
+                    f"{extension_round + 1}"
+                ),
+                batch_evaluator=batch_evaluator,
+            )
+            stage3_keys.update(outward_profiles)
+            candidates = sorted(
+                (summaries[key] for key in stage3_keys),
+                key=_candidate_sort_key,
+            )
+    _emit(progress, "Stage 3 search and boundary probes complete", 1, 1)
+    return stage3_keys, candidates
+
+
 def run_market_replay_analysis(
     config: MarketReplayConfig,
     *,
@@ -5436,941 +6139,971 @@ def run_market_replay_analysis(
         not exploratory_only and trading_day_count >= _MIN_ROBUST_TRADING_DAYS
     )
 
-    control_profile = _control_profile(normalized)
-    atr_cache: dict[AtrCacheKey, list[float | None]] = {}
-    summaries: dict[str, MarketReplayCandidateSummary] = {}
-    sessions_by_profile: dict[str, list[MarketReplaySessionResult]] = {}
-    policy_profiles, protective_policy_evidence, protective_policy_reason = _select_protective_policy(
-        recording,
-        period_ticks,
-        normalized,
-        atr_cache,
-        summaries,
-        sessions_by_profile,
-        progress=progress,
-        collect_diagnostics=True,
-    )
-    supported_protective_policies = {
-        (str(row.get("mode") or ""), float(row.get("value") or 0.0))
-        for row in protective_policy_evidence
-        if bool(row.get("selected_for_atr_search"))
-        and bool(row.get("eligible"))
-        and str(row.get("mode") or "") != "disabled"
-    }
-    policy_window_sets: list[tuple[AtrProfile, list[tuple[int, int]]]] = []
-    window_search: list[dict[str, Any]] = []
-    stage1_profiles: list[AtrProfile] = []
-    stage2_profiles: list[AtrProfile] = []
-    for policy in policy_profiles:
-        policy_windows, policy_rows, policy_stage1, policy_stage2 = _select_windows(
-            recording,
-            period_ticks,
-            normalized,
-            atr_cache,
-            summaries,
-            sessions_by_profile,
-            robustness_possible,
-            progress=progress,
-            base_profile=policy,
-        )
-        policy_window_sets.append((policy, policy_windows))
-        window_search.extend(policy_rows)
-        stage1_profiles.extend(policy_stage1)
-        stage2_profiles.extend(policy_stage2)
-    coarse_profiles = _coarse_profiles_for_policy_windows(
-        normalized,
-        policy_window_sets,
-        search_clamps=robustness_possible,
-    )
-    _evaluate_profiles(
-        recording,
-        period_ticks,
-        atr_cache,
-        coarse_profiles,
-        summaries,
-        sessions_by_profile,
-        normalized,
-        progress=progress,
-        message="Stage 3 of 3: evaluating multiplier profiles",
-    )
-    stage3_keys = {profile.key() for profile in coarse_profiles}
-    coarse_candidates = [summaries[key] for key in sorted(stage3_keys)]
-    seeds = _refinement_seeds(coarse_candidates) if robustness_possible else []
-    refined_profiles = (
-        [
-            profile
-            for profile in _refined_profiles(seeds, normalized)
-            if profile.key() not in stage3_keys
-        ]
-        if robustness_possible
-        else []
-    )
-    if refined_profiles:
-        _evaluate_profiles(
-            recording,
-            period_ticks,
-            atr_cache,
-            refined_profiles,
-            summaries,
-            sessions_by_profile,
-            normalized,
-            progress=progress,
-            message="Stage 3 of 3: refining multiplier profiles",
-        )
-    stage3_keys.update(profile.key() for profile in refined_profiles)
-    candidates = sorted(
-        (summaries[key] for key in stage3_keys),
-        key=_candidate_sort_key,
-    )
+    analysis_stack = ExitStack()
+    prepared_store: PreparedReplayStore | None = None
+    batch_evaluator: ProfileBatchEvaluator | None = None
+    total_rows = sum(len(ticks) for _period, ticks in period_ticks)
+    use_compact_engine = normalized.worker_processes != 0 or total_rows >= 50_000
+    try:
+        if use_compact_engine:
+            from .market_replay_fast import PreparedReplayStore, ProfileBatchEvaluator
 
-    # A stable region that touches the tested parameter boundary may simply be
-    # truncated by the search grid.  Probe outward twice before treating it as
-    # an interior supported plateau.  The probes become normal candidates and
-    # therefore participate in Pareto, policy, and stability evidence.
-    if robustness_possible:
-        for extension_round in range(2):
-            for candidate in candidates:
-                candidate.stable_region_id = ""
-                candidate.stable_region_size = 0
-                candidate.stable_region_center = False
-                candidate.near_best = False
-                candidate.evidence_stable = False
-            extension_centers = _stable_region_centers(
-                candidates,
-                sessions=trading_day_count,
+            _emit(progress, "Preparing analysis-wide replay workers", 0, 1)
+            prepared_store = analysis_stack.enter_context(
+                PreparedReplayStore.create(period_ticks)
             )
-            outward_profiles: dict[str, AtrProfile] = {}
-            for center, _ in extension_centers:
-                probes, _ = _boundary_extension_profiles(center, candidates)
-                for profile in probes:
-                    if profile.key() not in summaries:
-                        outward_profiles[profile.key()] = profile
-            if not outward_profiles:
-                break
-            _ensure_atr_windows(
-                period_ticks,
-                atr_cache,
-                sorted(
-                    {
-                        (profile.period, profile.bar_seconds)
-                        for profile in outward_profiles.values()
-                    }
-                ),
-                progress=progress,
-                message=(
-                    f"Extending truncated search boundaries, round {extension_round + 1}"
-                ),
+            batch_evaluator = analysis_stack.enter_context(
+                ProfileBatchEvaluator(
+                    prepared_store,
+                    min_tick=recording.min_tick,
+                    config=normalized,
+                    requested_workers=normalized.worker_processes,
+                    recording=recording,
+                )
             )
-            _evaluate_profiles(
+            _emit(
+                progress,
+                (
+                    "Preparing analysis-wide replay workers · "
+                    f"{batch_evaluator.execution_label}"
+                ),
+                1,
+                1,
+            )
+    except Exception:
+        analysis_stack.close()
+        raise
+
+    try:
+        control_profile = _control_profile(normalized)
+        atr_cache: dict[AtrCacheKey, list[float | None]] = {}
+        summaries: dict[str, MarketReplayCandidateSummary] = {}
+        sessions_by_profile: dict[str, list[MarketReplaySessionResult]] = {}
+        policy_profiles, protective_policy_evidence, protective_policy_reason = _select_protective_policy(
+            recording,
+            period_ticks,
+            normalized,
+            atr_cache,
+            summaries,
+            sessions_by_profile,
+            progress=progress,
+            collect_diagnostics=True,
+            prepared_store=prepared_store,
+            batch_evaluator=batch_evaluator,
+        )
+        supported_protective_policies = {
+            (str(row.get("mode") or ""), float(row.get("value") or 0.0))
+            for row in protective_policy_evidence
+            if bool(row.get("selected_for_atr_search"))
+            and bool(row.get("eligible"))
+            and str(row.get("mode") or "") != "disabled"
+        }
+        policy_window_sets: list[tuple[AtrProfile, list[tuple[int, int]]]] = []
+        window_search: list[dict[str, Any]] = []
+        stage1_profiles: list[AtrProfile] = []
+        stage2_profiles: list[AtrProfile] = []
+        for policy in policy_profiles:
+            policy_windows, policy_rows, policy_stage1, policy_stage2 = _select_windows(
                 recording,
                 period_ticks,
+                normalized,
                 atr_cache,
-                list(outward_profiles.values()),
                 summaries,
                 sessions_by_profile,
-                normalized,
+                robustness_possible,
                 progress=progress,
-                message=(
-                    f"Evaluating outward search-boundary probes, round {extension_round + 1}"
-                ),
+                base_profile=policy,
+                prepared_store=prepared_store,
+                batch_evaluator=batch_evaluator,
             )
-            stage3_keys.update(outward_profiles)
-            candidates = sorted(
-                (summaries[key] for key in stage3_keys),
-                key=_candidate_sort_key,
-            )
+            policy_window_sets.append((policy, policy_windows))
+            window_search.extend(policy_rows)
+            stage1_profiles.extend(policy_stage1)
+            stage2_profiles.extend(policy_stage2)
+    except Exception:
+        analysis_stack.close()
+        raise
 
-    control_summary = summaries[control_profile.key()]
-    control_sessions = sessions_by_profile[control_profile.key()]
-    leave_one_day_out_selection_rows = (
-        _leave_one_day_out_selection_rows(
+    def complete_analysis(
+        prepared_store: PreparedReplayStore | None,
+        batch_evaluator: ProfileBatchEvaluator | None,
+    ) -> MarketReplayAnalysisResult:
+        stage3_keys, candidates = _run_stage3_search(
             recording,
             period_ticks,
+            atr_cache,
+            summaries,
+            sessions_by_profile,
             normalized,
-        )
-        if robustness_possible
-        and trading_day_count >= _MIN_ROBUST_TRADING_DAYS
-        else []
-    )
-
-    selected_feed_evidence = [
-        _session_feed_evidence(recording, period)
-        for period, _ in period_ticks
-    ]
-    global_instability: list[str] = []
-    if exploratory_only:
-        global_instability.append(
-            "No recorded RTH session passed every primary coverage, feed, connectivity, completeness, and Last-event-density gate; all candidate results are exploratory only."
-        )
-    elif trading_day_count < _MIN_ROBUST_TRADING_DAYS:
-        global_instability.append(
-            f"Only {trading_day_count} primary-eligible trading day(s) were available; at least {_MIN_ROBUST_TRADING_DAYS} are required before bootstrap, leave-one-day-out, phase authorization, or a changed recommendation is attempted."
-        )
-    if recording.is_synthetic:
-        global_instability.append(
-            "The manifest identifies this as synthetic sample data. Analysis is supported for software validation, "
-            "but a changed ATR recommendation cannot be treated as stable live-market evidence."
-        )
-    if any(selected == "delayed" for selected, _, _ in selected_feed_evidence):
-        global_instability.append(
-            "At least one analyzed session used delayed market data because no live rows were available for that session."
-        )
-    if any(mixed for _, mixed, _ in selected_feed_evidence):
-        global_instability.append(
-            "At least one analyzed session contains both live and delayed rows. Live rows were preferred, but the feed transition reduces comparability."
-        )
-    if any(has_frozen for _, _, has_frozen in selected_feed_evidence):
-        global_instability.append(
-            "At least one analyzed session contains frozen or delayed-frozen rows. Those rows were excluded, but the feed interruption reduces evidence stability."
-        )
-    if any("captured_at_utc moved backwards" in issue for issue in recording.issues):
-        global_instability.append(
-            "The recorder receipt clock moved backwards. Monotonic event order was preserved, but UTC bar/session timing is less reliable."
+            policy_window_sets,
+            robustness_possible=robustness_possible,
+            trading_day_count=trading_day_count,
+            progress=progress,
+            prepared_store=prepared_store,
+            batch_evaluator=batch_evaluator,
         )
 
-    for candidate in candidates:
-        candidate.stable_region_id = ""
-        candidate.stable_region_size = 0
-        candidate.stable_region_center = False
-        candidate.near_best = False
-        candidate.evidence_stable = False
-    region_centers = (
-        _stable_region_centers(candidates, sessions=trading_day_count)
-        if robustness_possible
-        else []
-    )
-    pareto_keys = pareto_frontier(candidates) if candidates else set()
-    robustness_evidence: list[dict[str, Any]] = []
-    leave_one_out_by_key: dict[str, list[dict[str, Any]]] = {}
-    phase_cache: dict[tuple[str, int], list[MarketReplaySessionResult]] = {}
-    continuity_block_evidence: list[dict[str, Any]] = []
-    score_policy_evidence: list[dict[str, Any]] = []
-    moving_block_evidence: list[dict[str, Any]] = []
-    selection_bootstrap_evidence: list[dict[str, Any]] = []
-    walk_forward_evidence: list[dict[str, Any]] = []
-    pareto_evidence: list[dict[str, Any]] = []
-    boundary_evidence: list[dict[str, Any]] = []
-    assumption_stress_evidence: list[dict[str, Any]] = []
-    recommendation_gate_evidence: list[dict[str, Any]] = []
-    eligible_centers: list[
-        tuple[MarketReplayCandidateSummary, str, dict[str, Any]]
-    ] = []
-    for center, region_reason in region_centers:
-        center_key = center.profile.key()
-        candidate_sessions = sessions_by_profile[center_key]
-        exact_loo_cache: dict[
-            str,
-            tuple[
-                list[MarketReplaySessionResult],
-                list[MarketReplaySessionResult],
-            ],
-        ] = {}
-
-        def exact_loo(
-            omitted_day: str,
-        ) -> tuple[
-            list[MarketReplaySessionResult],
-            list[MarketReplaySessionResult],
-        ]:
-            if omitted_day not in exact_loo_cache:
-                subset = [
-                    item
-                    for item in period_ticks
-                    if item[0].session_date != omitted_day
-                ]
-                _, candidate_subset, _ = _evaluate_profile(
-                    recording,
-                    subset,
-                    atr_cache,
-                    center.profile,
-                    normalized,
-                    keep_details=False,
-                )
-                _, control_subset, _ = _evaluate_profile(
-                    recording,
-                    subset,
-                    atr_cache,
-                    control_summary.profile,
-                    normalized,
-                    keep_details=False,
-                )
-                exact_loo_cache[omitted_day] = (
-                    candidate_subset,
-                    control_subset,
-                )
-            return exact_loo_cache[omitted_day]
-
-        evidence, leave_one_out = _candidate_robustness(
-            center,
-            candidate_sessions,
-            control_summary,
-            control_sessions,
-            normalized,
-            seed=_market_replay_bootstrap_seed(
-                recording.sha256,
-                control_summary.profile,
-            ),
-            selection_rows=leave_one_day_out_selection_rows,
-            exact_leave_one_out=exact_loo,
-        )
-        base_passed = bool(evidence.get("passed"))
-        if base_passed:
-            phase_evidence = _atr_phase_robustness(
+        control_summary = summaries[control_profile.key()]
+        control_sessions = sessions_by_profile[control_profile.key()]
+        leave_one_day_out_selection_rows = (
+            _leave_one_day_out_selection_rows(
                 recording,
                 period_ticks,
-                center.profile,
-                control_summary.profile,
-                phase_cache,
                 normalized,
+                batch_evaluator=batch_evaluator,
+                progress=progress,
+            )
+            if robustness_possible
+            and trading_day_count >= _MIN_ROBUST_TRADING_DAYS
+            else []
+        )
+
+        selected_feed_evidence = [
+            _session_feed_evidence(recording, period)
+            for period, _ in period_ticks
+        ]
+        global_instability: list[str] = []
+        if exploratory_only:
+            global_instability.append(
+                "No recorded RTH session passed every primary coverage, feed, connectivity, completeness, and Last-event-density gate; all candidate results are exploratory only."
+            )
+        elif trading_day_count < _MIN_ROBUST_TRADING_DAYS:
+            global_instability.append(
+                f"Only {trading_day_count} primary-eligible trading day(s) were available; at least {_MIN_ROBUST_TRADING_DAYS} are required before bootstrap, leave-one-day-out, phase authorization, or a changed recommendation is attempted."
+            )
+        if recording.is_synthetic:
+            global_instability.append(
+                "The manifest identifies this as synthetic sample data. Analysis is supported for software validation, "
+                "but a changed ATR recommendation cannot be treated as stable live-market evidence."
+            )
+        if any(selected == "delayed" for selected, _, _ in selected_feed_evidence):
+            global_instability.append(
+                "At least one analyzed session used delayed market data because no live rows were available for that session."
+            )
+        if any(mixed for _, mixed, _ in selected_feed_evidence):
+            global_instability.append(
+                "At least one analyzed session contains both live and delayed rows. Live rows were preferred, but the feed transition reduces comparability."
+            )
+        if any(has_frozen for _, _, has_frozen in selected_feed_evidence):
+            global_instability.append(
+                "At least one analyzed session contains frozen or delayed-frozen rows. Those rows were excluded, but the feed interruption reduces evidence stability."
+            )
+        if any("captured_at_utc moved backwards" in issue for issue in recording.issues):
+            global_instability.append(
+                "The recorder receipt clock moved backwards. Monotonic event order was preserved, but UTC bar/session timing is less reliable."
+            )
+
+        for candidate in candidates:
+            candidate.stable_region_id = ""
+            candidate.stable_region_size = 0
+            candidate.stable_region_center = False
+            candidate.near_best = False
+            candidate.evidence_stable = False
+        region_centers = (
+            _stable_region_centers(candidates, sessions=trading_day_count)
+            if robustness_possible
+            else []
+        )
+        pareto_keys = pareto_frontier(candidates) if candidates else set()
+        robustness_evidence: list[dict[str, Any]] = []
+        leave_one_out_by_key: dict[str, list[dict[str, Any]]] = {}
+        phase_cache: dict[tuple[str, int], list[MarketReplaySessionResult]] = {}
+        continuity_block_evidence: list[dict[str, Any]] = []
+        score_policy_evidence: list[dict[str, Any]] = []
+        moving_block_evidence: list[dict[str, Any]] = []
+        selection_bootstrap_evidence: list[dict[str, Any]] = []
+        walk_forward_evidence: list[dict[str, Any]] = []
+        pareto_evidence: list[dict[str, Any]] = []
+        boundary_evidence: list[dict[str, Any]] = []
+        assumption_stress_evidence: list[dict[str, Any]] = []
+        recommendation_gate_evidence: list[dict[str, Any]] = []
+        eligible_centers: list[
+            tuple[MarketReplayCandidateSummary, str, dict[str, Any]]
+        ] = []
+        if region_centers:
+            _emit(
+                progress,
+                "Post-Stage 3: preparing stable-region robustness validation",
+                0,
+                len(region_centers),
             )
         else:
-            phase_evidence = {
-                "atr_phase_cases": 0,
-                "atr_phase_finite_cases": 0,
-                "atr_phase_min_score_delta": None,
-                "atr_phase_median_score_delta": None,
-                "atr_phase_max_score_delta": None,
-                "atr_phase_adverse_score_delta": None,
-                "atr_phase_candidate_offsets": [],
-                "atr_phase_control_offsets": [],
-                "atr_phase_failure_reasons": [
-                    "ATR bar-phase stress was skipped because the candidate had already failed an earlier robustness gate."
-                ],
-                "atr_phase_passed": False,
-            }
-        evidence.update(phase_evidence)
+            _emit(
+                progress,
+                "Post-Stage 3: no stable-region centers require robustness validation",
+                1,
+                1,
+            )
+        for center_index, (center, region_reason) in enumerate(
+            region_centers,
+            start=1,
+        ):
+            center_key = center.profile.key()
+            candidate_sessions = sessions_by_profile[center_key]
+            exact_days = sorted(
+                _paired_sessions_by_day(candidate_sessions, control_sessions)
+            )
+            exact_loo_cache = _exact_leave_one_out_results(
+                recording,
+                period_ticks,
+                normalized,
+                center.profile,
+                control_summary.profile,
+                exact_days,
+                batch_evaluator=batch_evaluator,
+                progress=progress,
+                progress_message=(
+                    "Post-Stage 3 "
+                    f"({center_index}/{len(region_centers)}): "
+                    "fixed-profile leave-one-day-out replays"
+                ),
+            )
 
-        policy_rows = score_policy_comparison(
-            candidate_sessions,
-            control_sessions,
-            turnover_penalty_bps_per_completed_trade=(
-                normalized.turnover_penalty_bps_per_completed_trade
-            ),
-        )
-        policy_passed = bool(policy_rows) and all(
-            bool(row["passed"]) for row in policy_rows
-        )
-        center.score_policy_results = [dict(row) for row in policy_rows]
-        center.score_policy_all_positive = policy_passed
-        score_policy_evidence.extend(
-            {"profile_key": center_key, **row} for row in policy_rows
-        )
+            def exact_loo(
+                omitted_day: str,
+            ) -> tuple[
+                list[MarketReplaySessionResult],
+                list[MarketReplaySessionResult],
+            ]:
+                try:
+                    return exact_loo_cache[omitted_day]
+                except KeyError as exc:
+                    raise MarketReplayAnalysisError(
+                        "Exact leave-one-day-out evidence was not prepared for "
+                        f"{omitted_day}."
+                    ) from exc
 
-        dominators = sorted(
-            candidate.profile.key()
-            for candidate in candidates
-            if candidate.profile.key() != center_key
-            and pareto_dominates(candidate, center)
-        )
-        center.pareto_frontier = center_key in pareto_keys
-        center.pareto_dominated_by = dominators
-        pareto_row = {
-            "profile_key": center_key,
-            "on_frontier": center.pareto_frontier,
-            "dominated_by": dominators,
-            "passed": center.pareto_frontier,
-        }
-        pareto_evidence.append(pareto_row)
-
-        boundary_probes, boundary_rows = _boundary_extension_profiles(
-            center,
-            candidates,
-        )
-        del boundary_probes
-        boundary_result = _resolve_boundary_evidence(
-            center,
-            boundary_rows,
-            summaries,
-        )
-        center.boundary_dimensions = sorted(
-            {str(row["dimension"]) for row in boundary_rows}
-        )
-        center.boundary_extension_attempted = bool(boundary_rows)
-        center.boundary_resolved = bool(boundary_result["resolved"])
-        boundary_evidence.append(boundary_result)
-
-        continuity_result = _continuity_block_comparison(
-            candidate_sessions,
-            control_sessions,
-        )
-        continuity_block_evidence.append(
-            {"profile_key": center_key, **continuity_result}
-        )
-
-        protective_policy_key = (
-            center.profile.protective_sell_mode,
-            center.profile.protective_sell_value,
-        )
-        protective_policy_passed = (
-            center.profile.protective_sell_mode == "disabled"
-            or protective_policy_key in supported_protective_policies
-        )
-        center.protective_policy_stable = protective_policy_passed
-
-        pre_advanced_passed = (
-            base_passed
-            and bool(phase_evidence.get("atr_phase_passed"))
-            and policy_passed
-            and center.pareto_frontier
-            and center.boundary_resolved
-            and bool(continuity_result.get("passed"))
-            and protective_policy_passed
-        )
-        if pre_advanced_passed:
-            moving_result = _moving_block_robustness(
+            evidence, leave_one_out = _candidate_robustness(
                 center,
                 candidate_sessions,
                 control_summary,
                 control_sessions,
                 normalized,
-                seed=(
-                    _market_replay_bootstrap_seed(
-                        recording.sha256,
-                        control_summary.profile,
-                    )
-                    + "|moving-block"
+                seed=_market_replay_bootstrap_seed(
+                    recording.sha256,
+                    control_summary.profile,
                 ),
+                selection_rows=leave_one_day_out_selection_rows,
+                exact_leave_one_out=exact_loo,
             )
-        else:
-            skipped_reason = (
-                "Skipped because an earlier recommendation authorization gate failed."
-            )
-            moving_result = {
-                "evaluated": False,
-                "passed": False,
-                "replicates": 0,
-                "block_length": None,
-                "probability_positive_pct": None,
-                "failure_reasons": [skipped_reason],
-            }
+            base_passed = bool(evidence.get("passed"))
+            if base_passed:
+                phase_evidence = _atr_phase_robustness(
+                    recording,
+                    period_ticks,
+                    center.profile,
+                    control_summary.profile,
+                    phase_cache,
+                    normalized,
+                    batch_evaluator=batch_evaluator,
+                    progress=progress,
+                    progress_message=(
+                        "Post-Stage 3 "
+                        f"({center_index}/{len(region_centers)}): ATR bar-phase stress"
+                    ),
+                )
+            else:
+                phase_evidence = {
+                    "atr_phase_cases": 0,
+                    "atr_phase_finite_cases": 0,
+                    "atr_phase_min_score_delta": None,
+                    "atr_phase_median_score_delta": None,
+                    "atr_phase_max_score_delta": None,
+                    "atr_phase_adverse_score_delta": None,
+                    "atr_phase_candidate_offsets": [],
+                    "atr_phase_control_offsets": [],
+                    "atr_phase_failure_reasons": [
+                        "ATR bar-phase stress was skipped because the candidate had already failed an earlier robustness gate."
+                    ],
+                    "atr_phase_passed": False,
+                }
+            evidence.update(phase_evidence)
 
-        if pre_advanced_passed and bool(moving_result.get("passed")):
-            stress_result = _assumption_stress_validation(
-                recording,
-                period_ticks,
-                center.profile,
-                control_summary.profile,
-                normalized,
-                buy_cost_p90=calibration.buy_total_adverse_cost_bps_p90,
-                sell_cost_p90=calibration.sell_total_adverse_cost_bps_p90,
-            )
-        else:
-            skipped_reason = (
-                "Skipped because an earlier recommendation authorization gate failed."
-            )
-            stress_result = {
-                "evaluated": False,
-                "passed": False,
-                "rows": [],
-                "failure_reasons": [skipped_reason],
-            }
-        moving_block_evidence.append({"profile_key": center_key, **moving_result})
-        assumption_stress_evidence.append(
-            {"profile_key": center_key, **stress_result}
-        )
-
-        before_expensive_passed = (
-            pre_advanced_passed
-            and bool(moving_result.get("passed"))
-            and bool(stress_result.get("passed"))
-        )
-        if before_expensive_passed:
-            walk_result = _walk_forward_validation(
-                recording,
-                period_ticks,
-                center.profile,
-                normalized,
-            )
-            selection_result = _selection_aware_bootstrap(
-                recording,
-                period_ticks,
-                center.profile,
+            policy_rows = score_policy_comparison(
                 candidate_sessions,
                 control_sessions,
-                normalized,
-                seed=(
-                    _market_replay_bootstrap_seed(
-                        recording.sha256,
-                        control_summary.profile,
-                    )
-                    + "|selection-aware"
+                turnover_penalty_bps_per_completed_trade=(
+                    normalized.turnover_penalty_bps_per_completed_trade
                 ),
-                dependency_session_groups=sessions_by_profile.values(),
             )
-        else:
-            skipped_reason = (
-                "Skipped because an earlier recommendation authorization gate failed."
+            policy_passed = bool(policy_rows) and all(
+                bool(row["passed"]) for row in policy_rows
             )
-            walk_result = {
-                "evaluated": False,
-                "passed": False,
-                "folds": 0,
-                "rows": [],
-                "failure_reasons": [skipped_reason],
-            }
-            selection_result = {
-                "evaluated": False,
-                "passed": False,
-                "replicates": 0,
-                "oob_evaluations": 0,
-                "rows": [],
-                "failure_reasons": [skipped_reason],
-            }
-        walk_forward_evidence.append({"profile_key": center_key, **walk_result})
-        selection_bootstrap_evidence.append(
-            {"profile_key": center_key, **selection_result}
-        )
+            center.score_policy_results = [dict(row) for row in policy_rows]
+            center.score_policy_all_positive = policy_passed
+            score_policy_evidence.extend(
+                {"profile_key": center_key, **row} for row in policy_rows
+            )
 
-        center.moving_block_replicates = int(moving_result.get("replicates") or 0)
-        center.moving_block_length = int(moving_result.get("block_length") or 0)
-        center.moving_block_ci80_low = moving_result.get("ci80_low")
-        center.moving_block_ci80_high = moving_result.get("ci80_high")
-        center.moving_block_probability_positive_pct = moving_result.get(
-            "probability_positive_pct"
-        )
-        center.selection_bootstrap_replicates = int(
-            selection_result.get("replicates") or 0
-        )
-        center.selection_bootstrap_oob_evaluations = int(
-            selection_result.get("oob_evaluations") or 0
-        )
-        center.selection_bootstrap_probability_positive_pct = selection_result.get(
-            "probability_positive_pct"
-        )
-        center.selection_bootstrap_median_oob_delta = selection_result.get(
-            "median_oob_delta"
-        )
-        center.selection_bootstrap_control_selection_pct = selection_result.get(
-            "control_selection_pct"
-        )
-        center.walk_forward_folds = int(walk_result.get("folds") or 0)
-        center.walk_forward_positive_folds = int(
-            walk_result.get("positive_fixed_folds") or 0
-        )
-        center.walk_forward_probability_positive_pct = walk_result.get(
-            "fixed_probability_positive_pct"
-        )
-        center.walk_forward_median_delta = walk_result.get("fixed_median_delta")
-        center.walk_forward_worst_delta = walk_result.get("fixed_worst_delta")
-        center.walk_forward_same_window_pct = walk_result.get("same_atr_window_pct")
-        center.assumption_stress_results = [
-            dict(row) for row in stress_result.get("rows") or []
-        ]
-        center.assumption_stress_all_positive = bool(stress_result.get("passed"))
+            dominators = sorted(
+                candidate.profile.key()
+                for candidate in candidates
+                if candidate.profile.key() != center_key
+                and pareto_dominates(candidate, center)
+            )
+            center.pareto_frontier = center_key in pareto_keys
+            center.pareto_dominated_by = dominators
+            pareto_row = {
+                "profile_key": center_key,
+                "on_frontier": center.pareto_frontier,
+                "dominated_by": dominators,
+                "passed": center.pareto_frontier,
+            }
+            pareto_evidence.append(pareto_row)
 
-        raw_region_stable = center.evidence_stable
-        changed_profile = center_key != control_summary.profile.key()
-        gate_rows = recommendation_gate_rows(
-            [
-                {
-                    "gate_key": "01_source_quality",
-                    "gate_label": "Source quality",
-                    "passed": not global_instability,
-                    "detail": " | ".join(global_instability) or "All source-quality gates passed.",
-                },
-                {
-                    "gate_key": "02_stable_region",
-                    "gate_label": "Stable parameter region",
-                    "passed": raw_region_stable,
-                    "detail": region_reason,
-                },
-                {
-                    "gate_key": "03_protective_policy",
-                    "gate_label": "Protective SELL policy stability",
-                    "passed": protective_policy_passed,
-                    "detail": (
-                        "Protective SELL is disabled for this profile."
-                        if center.profile.protective_sell_mode == "disabled"
-                        else protective_policy_reason
-                        if protective_policy_passed
-                        else "The profile uses a protective SELL policy that did not pass the independent bounded policy screen."
+            boundary_probes, boundary_rows = _boundary_extension_profiles(
+                center,
+                candidates,
+            )
+            del boundary_probes
+            boundary_result = _resolve_boundary_evidence(
+                center,
+                boundary_rows,
+                summaries,
+            )
+            center.boundary_dimensions = sorted(
+                {str(row["dimension"]) for row in boundary_rows}
+            )
+            center.boundary_extension_attempted = bool(boundary_rows)
+            center.boundary_resolved = bool(boundary_result["resolved"])
+            boundary_evidence.append(boundary_result)
+
+            continuity_result = _continuity_block_comparison(
+                candidate_sessions,
+                control_sessions,
+            )
+            continuity_block_evidence.append(
+                {"profile_key": center_key, **continuity_result}
+            )
+
+            protective_policy_key = (
+                center.profile.protective_sell_mode,
+                center.profile.protective_sell_value,
+            )
+            protective_policy_passed = (
+                center.profile.protective_sell_mode == "disabled"
+                or protective_policy_key in supported_protective_policies
+            )
+            center.protective_policy_stable = protective_policy_passed
+
+            pre_advanced_passed = (
+                base_passed
+                and bool(phase_evidence.get("atr_phase_passed"))
+                and policy_passed
+                and center.pareto_frontier
+                and center.boundary_resolved
+                and bool(continuity_result.get("passed"))
+                and protective_policy_passed
+            )
+            if pre_advanced_passed:
+                _emit(
+                    progress,
+                    (
+                        "Post-Stage 3 "
+                        f"({center_index}/{len(region_centers)}): moving-block bootstrap"
                     ),
-                },
-                {
-                    "gate_key": "04_paired_bootstrap_and_loo",
-                    "gate_label": "Paired bootstrap and exact leave-one-day-out",
-                    "passed": base_passed,
-                    "detail": " | ".join(evidence.get("failure_reasons") or []) or "Passed.",
-                },
-                {
-                    "gate_key": "05_atr_phase",
-                    "gate_label": "ATR bar-phase stress",
-                    "passed": bool(phase_evidence.get("atr_phase_passed")),
-                    "detail": " | ".join(phase_evidence.get("atr_phase_failure_reasons") or []) or "Passed.",
-                },
-                {
-                    "gate_key": "06_score_policies",
-                    "gate_label": "Score-policy stability",
-                    "passed": policy_passed,
-                    "detail": "All predefined score policies favored the candidate." if policy_passed else "At least one predefined score policy did not favor the candidate.",
-                },
-                {
-                    "gate_key": "07_pareto",
-                    "gate_label": "Pareto frontier",
-                    "passed": center.pareto_frontier,
-                    "detail": "Candidate is non-dominated." if center.pareto_frontier else f"Dominated by {', '.join(dominators)}.",
-                },
-                {
-                    "gate_key": "08_search_boundary",
-                    "gate_label": "Search-boundary support",
-                    "passed": center.boundary_resolved,
-                    "detail": "Search boundary resolved." if center.boundary_resolved else f"Unresolved dimensions: {', '.join(boundary_result['unresolved_dimensions'])}.",
-                },
-                {
-                    "gate_key": "09_economic_continuity",
-                    "gate_label": "Economic continuity blocks",
-                    "passed": bool(continuity_result.get("passed")),
-                    "detail": " | ".join(continuity_result.get("failure_reasons") or []) or "Passed.",
-                },
-                {
-                    "gate_key": "10_moving_block",
-                    "gate_label": "Moving-block bootstrap",
-                    "passed": bool(moving_result.get("passed")),
-                    "detail": " | ".join(moving_result.get("failure_reasons") or []) or "Passed.",
-                },
-                {
-                    "gate_key": "11_assumption_stress",
-                    "gate_label": "Assumption stress",
-                    "passed": bool(stress_result.get("passed")),
-                    "detail": " | ".join(stress_result.get("failure_reasons") or []) or "Passed.",
-                },
-                {
-                    "gate_key": "12_walk_forward",
-                    "gate_label": "Chronological walk-forward",
-                    "passed": bool(walk_result.get("passed")),
-                    "detail": " | ".join(walk_result.get("failure_reasons") or []) or "Passed.",
-                },
-                {
-                    "gate_key": "13_selection_bootstrap",
-                    "gate_label": "Selection-aware bootstrap",
-                    "passed": bool(selection_result.get("passed")),
-                    "detail": " | ".join(selection_result.get("failure_reasons") or []) or "Passed.",
-                },
+                    0,
+                    1,
+                )
+                moving_result = _moving_block_robustness(
+                    center,
+                    candidate_sessions,
+                    control_summary,
+                    control_sessions,
+                    normalized,
+                    seed=(
+                        _market_replay_bootstrap_seed(
+                            recording.sha256,
+                            control_summary.profile,
+                        )
+                        + "|moving-block"
+                    ),
+                )
+                _emit(
+                    progress,
+                    (
+                        "Post-Stage 3 "
+                        f"({center_index}/{len(region_centers)}): moving-block bootstrap"
+                    ),
+                    1,
+                    1,
+                )
+            else:
+                skipped_reason = (
+                    "Skipped because an earlier recommendation authorization gate failed."
+                )
+                moving_result = {
+                    "evaluated": False,
+                    "passed": False,
+                    "replicates": 0,
+                    "block_length": None,
+                    "probability_positive_pct": None,
+                    "failure_reasons": [skipped_reason],
+                }
+
+            if pre_advanced_passed and bool(moving_result.get("passed")):
+                stress_result = _assumption_stress_validation(
+                    recording,
+                    period_ticks,
+                    center.profile,
+                    control_summary.profile,
+                    normalized,
+                    buy_cost_p90=calibration.buy_total_adverse_cost_bps_p90,
+                    sell_cost_p90=calibration.sell_total_adverse_cost_bps_p90,
+                    batch_evaluator=batch_evaluator,
+                    progress=progress,
+                    progress_message=(
+                        "Post-Stage 3 "
+                        f"({center_index}/{len(region_centers)}): assumption-stress replays"
+                    ),
+                )
+            else:
+                skipped_reason = (
+                    "Skipped because an earlier recommendation authorization gate failed."
+                )
+                stress_result = {
+                    "evaluated": False,
+                    "passed": False,
+                    "rows": [],
+                    "failure_reasons": [skipped_reason],
+                }
+            moving_block_evidence.append({"profile_key": center_key, **moving_result})
+            assumption_stress_evidence.append(
+                {"profile_key": center_key, **stress_result}
+            )
+
+            before_expensive_passed = (
+                pre_advanced_passed
+                and bool(moving_result.get("passed"))
+                and bool(stress_result.get("passed"))
+            )
+            if before_expensive_passed:
+                walk_result = _walk_forward_validation(
+                    recording,
+                    period_ticks,
+                    center.profile,
+                    normalized,
+                    batch_evaluator=batch_evaluator,
+                    progress=progress,
+                    progress_message=(
+                        "Post-Stage 3 "
+                        f"({center_index}/{len(region_centers)}): walk-forward folds"
+                    ),
+                )
+                selection_result = _selection_aware_bootstrap(
+                    recording,
+                    period_ticks,
+                    center.profile,
+                    candidate_sessions,
+                    control_sessions,
+                    normalized,
+                    seed=(
+                        _market_replay_bootstrap_seed(
+                            recording.sha256,
+                            control_summary.profile,
+                        )
+                        + "|selection-aware"
+                    ),
+                    dependency_session_groups=sessions_by_profile.values(),
+                    batch_evaluator=batch_evaluator,
+                    progress=progress,
+                    progress_message=(
+                        "Post-Stage 3 "
+                        f"({center_index}/{len(region_centers)}): "
+                        "selection-aware bootstrap replicates"
+                    ),
+                )
+            else:
+                skipped_reason = (
+                    "Skipped because an earlier recommendation authorization gate failed."
+                )
+                walk_result = {
+                    "evaluated": False,
+                    "passed": False,
+                    "folds": 0,
+                    "rows": [],
+                    "failure_reasons": [skipped_reason],
+                }
+                selection_result = {
+                    "evaluated": False,
+                    "passed": False,
+                    "replicates": 0,
+                    "oob_evaluations": 0,
+                    "rows": [],
+                    "failure_reasons": [skipped_reason],
+                }
+            walk_forward_evidence.append({"profile_key": center_key, **walk_result})
+            selection_bootstrap_evidence.append(
+                {"profile_key": center_key, **selection_result}
+            )
+            _emit(
+                progress,
+                "Post-Stage 3: stable-region robustness validation",
+                center_index,
+                len(region_centers),
+            )
+
+            center.moving_block_replicates = int(moving_result.get("replicates") or 0)
+            center.moving_block_length = int(moving_result.get("block_length") or 0)
+            center.moving_block_ci80_low = moving_result.get("ci80_low")
+            center.moving_block_ci80_high = moving_result.get("ci80_high")
+            center.moving_block_probability_positive_pct = moving_result.get(
+                "probability_positive_pct"
+            )
+            center.selection_bootstrap_replicates = int(
+                selection_result.get("replicates") or 0
+            )
+            center.selection_bootstrap_oob_evaluations = int(
+                selection_result.get("oob_evaluations") or 0
+            )
+            center.selection_bootstrap_probability_positive_pct = selection_result.get(
+                "probability_positive_pct"
+            )
+            center.selection_bootstrap_median_oob_delta = selection_result.get(
+                "median_oob_delta"
+            )
+            center.selection_bootstrap_control_selection_pct = selection_result.get(
+                "control_selection_pct"
+            )
+            center.walk_forward_folds = int(walk_result.get("folds") or 0)
+            center.walk_forward_positive_folds = int(
+                walk_result.get("positive_fixed_folds") or 0
+            )
+            center.walk_forward_probability_positive_pct = walk_result.get(
+                "fixed_probability_positive_pct"
+            )
+            center.walk_forward_median_delta = walk_result.get("fixed_median_delta")
+            center.walk_forward_worst_delta = walk_result.get("fixed_worst_delta")
+            center.walk_forward_same_window_pct = walk_result.get("same_atr_window_pct")
+            center.assumption_stress_results = [
+                dict(row) for row in stress_result.get("rows") or []
             ]
-        )
-        center.recommendation_gates = gate_rows
-        recommendation_gate_evidence.extend(
-            {"profile_key": center_key, **row} for row in gate_rows
-        )
-        all_required_passed = all(
-            not row["required"] or row["passed"] for row in gate_rows
-        )
-        evidence["failure_reasons"] = sorted(
-            set(
+            center.assumption_stress_all_positive = bool(stress_result.get("passed"))
+
+            raw_region_stable = center.evidence_stable
+            changed_profile = center_key != control_summary.profile.key()
+            gate_rows = recommendation_gate_rows(
                 [
-                    *list(evidence.get("failure_reasons") or []),
-                    *list(phase_evidence.get("atr_phase_failure_reasons") or []),
-                    *list(continuity_result.get("failure_reasons") or []),
-                    *list(moving_result.get("failure_reasons") or []),
-                    *list(stress_result.get("failure_reasons") or []),
-                    *list(walk_result.get("failure_reasons") or []),
-                    *list(selection_result.get("failure_reasons") or []),
+                    {
+                        "gate_key": "01_source_quality",
+                        "gate_label": "Source quality",
+                        "passed": not global_instability,
+                        "detail": " | ".join(global_instability) or "All source-quality gates passed.",
+                    },
+                    {
+                        "gate_key": "02_stable_region",
+                        "gate_label": "Stable parameter region",
+                        "passed": raw_region_stable,
+                        "detail": region_reason,
+                    },
+                    {
+                        "gate_key": "03_protective_policy",
+                        "gate_label": "Protective SELL policy stability",
+                        "passed": protective_policy_passed,
+                        "detail": (
+                            "Protective SELL is disabled for this profile."
+                            if center.profile.protective_sell_mode == "disabled"
+                            else protective_policy_reason
+                            if protective_policy_passed
+                            else "The profile uses a protective SELL policy that did not pass the independent bounded policy screen."
+                        ),
+                    },
+                    {
+                        "gate_key": "04_paired_bootstrap_and_loo",
+                        "gate_label": "Paired bootstrap and exact leave-one-day-out",
+                        "passed": base_passed,
+                        "detail": " | ".join(evidence.get("failure_reasons") or []) or "Passed.",
+                    },
+                    {
+                        "gate_key": "05_atr_phase",
+                        "gate_label": "ATR bar-phase stress",
+                        "passed": bool(phase_evidence.get("atr_phase_passed")),
+                        "detail": " | ".join(phase_evidence.get("atr_phase_failure_reasons") or []) or "Passed.",
+                    },
+                    {
+                        "gate_key": "06_score_policies",
+                        "gate_label": "Score-policy stability",
+                        "passed": policy_passed,
+                        "detail": "All predefined score policies favored the candidate." if policy_passed else "At least one predefined score policy did not favor the candidate.",
+                    },
+                    {
+                        "gate_key": "07_pareto",
+                        "gate_label": "Pareto frontier",
+                        "passed": center.pareto_frontier,
+                        "detail": "Candidate is non-dominated." if center.pareto_frontier else f"Dominated by {', '.join(dominators)}.",
+                    },
+                    {
+                        "gate_key": "08_search_boundary",
+                        "gate_label": "Search-boundary support",
+                        "passed": center.boundary_resolved,
+                        "detail": "Search boundary resolved." if center.boundary_resolved else f"Unresolved dimensions: {', '.join(boundary_result['unresolved_dimensions'])}.",
+                    },
+                    {
+                        "gate_key": "09_economic_continuity",
+                        "gate_label": "Economic continuity blocks",
+                        "passed": bool(continuity_result.get("passed")),
+                        "detail": " | ".join(continuity_result.get("failure_reasons") or []) or "Passed.",
+                    },
+                    {
+                        "gate_key": "10_moving_block",
+                        "gate_label": "Moving-block bootstrap",
+                        "passed": bool(moving_result.get("passed")),
+                        "detail": " | ".join(moving_result.get("failure_reasons") or []) or "Passed.",
+                    },
+                    {
+                        "gate_key": "11_assumption_stress",
+                        "gate_label": "Assumption stress",
+                        "passed": bool(stress_result.get("passed")),
+                        "detail": " | ".join(stress_result.get("failure_reasons") or []) or "Passed.",
+                    },
+                    {
+                        "gate_key": "12_walk_forward",
+                        "gate_label": "Chronological walk-forward",
+                        "passed": bool(walk_result.get("passed")),
+                        "detail": " | ".join(walk_result.get("failure_reasons") or []) or "Passed.",
+                    },
+                    {
+                        "gate_key": "13_selection_bootstrap",
+                        "gate_label": "Selection-aware bootstrap",
+                        "passed": bool(selection_result.get("passed")),
+                        "detail": " | ".join(selection_result.get("failure_reasons") or []) or "Passed.",
+                    },
                 ]
             )
-        )
-        evidence["passed"] = all_required_passed
-        _apply_robustness(center, evidence)
-        eligible = changed_profile and all_required_passed
-        center.evidence_stable = eligible
-        if global_instability:
-            center.instability_reasons.extend(global_instability)
-        if not eligible:
-            center.instability_reasons.extend(
-                row["detail"] for row in gate_rows if row["required"] and not row["passed"]
+            center.recommendation_gates = gate_rows
+            recommendation_gate_evidence.extend(
+                {"profile_key": center_key, **row} for row in gate_rows
             )
-        center.instability_reasons = sorted(set(center.instability_reasons))
-        evidence = {
-            **evidence,
-            "stable_region_id": center.stable_region_id,
-            "stable_region_size": center.stable_region_size,
-            "raw_region_stable": raw_region_stable,
-            "changed_profile": changed_profile,
-            "global_instability_reasons": list(global_instability),
-            "eligible_for_changed_recommendation": eligible,
-            "region_selection_reason": region_reason,
-            "score_policy_results": policy_rows,
-            "pareto": pareto_row,
-            "boundary": boundary_result,
-            "continuity_blocks": continuity_result,
-            "moving_block": moving_result,
-            "assumption_stress": stress_result,
-            "walk_forward": walk_result,
-            "selection_bootstrap": selection_result,
-            "recommendation_gates": gate_rows,
-        }
-        robustness_evidence.append(evidence)
-        leave_one_out_by_key[center_key] = leave_one_out
-        if eligible:
-            eligible_centers.append((center, region_reason, evidence))
-
-
-    def robust_order(
-        item: tuple[MarketReplayCandidateSummary, str, dict[str, Any]],
-    ) -> tuple[Any, ...]:
-        center, _, evidence = item
-
-        def finite_or_negative(value: Any) -> float:
-            try:
-                number = float(value)
-            except (TypeError, ValueError, OverflowError):
-                return -math.inf
-            return number if math.isfinite(number) else -math.inf
-
-        return (
-            -finite_or_negative(
-                (evidence.get("walk_forward") or {}).get("fixed_worst_delta")
-            ),
-            -finite_or_negative(
-                (evidence.get("selection_bootstrap") or {}).get("ci80_low")
-            ),
-            -finite_or_negative(
-                (evidence.get("moving_block") or {}).get("ci80_low")
-            ),
-            -finite_or_negative(evidence.get("bootstrap_ci80_low")),
-            -finite_or_negative(evidence.get("leave_one_day_out_min_delta")),
-            -finite_or_negative(evidence.get("atr_phase_adverse_score_delta")),
-            -finite_or_negative(evidence.get("atr_phase_min_score_delta")),
-            -finite_or_negative(evidence.get("observed_score_delta")),
-            -center.score,
-            -center.stable_region_size,
-            _profile_distance(center.profile),
-            center.profile.key(),
-        )
-
-    eligible_centers.sort(key=robust_order)
-    chosen: MarketReplayCandidateSummary | None = None
-    chosen_reason = ""
-    if eligible_centers:
-        chosen, region_reason, _ = eligible_centers[0]
-        chosen_reason = (
-            f"{region_reason} The candidate passed every required source-quality, paired, bootstrap, "
-            "leave-one-day-out, ATR-phase, score-policy, Pareto, search-boundary, economic-continuity, "
-            "assumption-stress, selection-aware out-of-bag, and chronological walk-forward gate against "
-            "the unchanged BouncyBot control."
-        )
-
-    if chosen is None:
-        chosen = control_summary
-        chosen.evidence_stable = False
-        control_selection = _selection_stability(
-            control_profile,
-            leave_one_day_out_selection_rows,
-        )
-        chosen.leave_one_day_out_selection_runs = int(
-            control_selection.get("selection_runs") or 0
-        )
-        chosen.leave_one_day_out_exact_profile_selections = int(
-            control_selection.get("exact_profile_selections") or 0
-        )
-        chosen.leave_one_day_out_exact_profile_selection_pct = (
-            control_selection.get("exact_profile_selection_pct")
-        )
-        chosen.leave_one_day_out_same_window_selections = int(
-            control_selection.get("same_atr_window_selections") or 0
-        )
-        chosen.leave_one_day_out_same_window_selection_pct = (
-            control_selection.get("same_atr_window_selection_pct")
-        )
-        if all(candidate.sessions_with_trades == 0 for candidate in candidates):
-            chosen_reason = (
-                "No searched profile completed a simulated trade. No data-supported ATR change was found; "
-                "the unchanged BouncyBot control is displayed for reference."
+            all_required_passed = all(
+                not row["required"] or row["passed"] for row in gate_rows
             )
-            chosen.instability_reasons.append(
-                "No candidate produced a simulated trade in the recorded data."
+            evidence["failure_reasons"] = sorted(
+                set(
+                    [
+                        *list(evidence.get("failure_reasons") or []),
+                        *list(phase_evidence.get("atr_phase_failure_reasons") or []),
+                        *list(continuity_result.get("failure_reasons") or []),
+                        *list(moving_result.get("failure_reasons") or []),
+                        *list(stress_result.get("failure_reasons") or []),
+                        *list(walk_result.get("failure_reasons") or []),
+                        *list(selection_result.get("failure_reasons") or []),
+                    ]
+                )
             )
-        elif global_instability:
-            chosen_reason = (
-                "A changed profile cannot be recommended because the recording failed one or more source-quality "
-                "stability gates. No data-supported ATR change was found; the unchanged BouncyBot control is "
-                "displayed for reference."
-            )
-        elif region_centers:
-            chosen_reason = (
-                "No changed stable-region center passed every recommendation authorization gate, including "
-                "paired outcomes, day and moving-block bootstrap, exact leave-one-day-out reselection, ATR phase, "
-                "score-policy stability, Pareto non-domination, resolved search boundaries, assumption stress, "
-                "selection-aware out-of-bag bootstrap, and chronological walk-forward validation. No data-supported "
-                "ATR change was found; the unchanged BouncyBot control is displayed for reference."
-            )
-        else:
-            chosen_reason = (
-                "No supported adjacent near-best multiplier region was found. No data-supported ATR change was found; "
-                "the unchanged BouncyBot control is displayed for reference."
-            )
-        chosen.instability_reasons.extend(
-            [
-                "No changed profile passed every default robustness gate.",
-                *global_instability,
-            ]
-        )
-        chosen.instability_reasons = sorted(set(chosen.instability_reasons))
-        recommendation_leave_one_out = [
-            {
-                "candidate_profile_key": control_profile.key(),
-                "control_profile_key": control_profile.key(),
-                "omitted_trading_day": row["omitted_trading_day"],
-                "remaining_trading_days": max(
-                    0,
-                    len(leave_one_day_out_selection_rows) - 1,
-                ),
-                "score_delta": 0.0,
-                **row,
+            evidence["passed"] = all_required_passed
+            _apply_robustness(center, evidence)
+            eligible = changed_profile and all_required_passed
+            center.evidence_stable = eligible
+            if global_instability:
+                center.instability_reasons.extend(global_instability)
+            if not eligible:
+                center.instability_reasons.extend(
+                    row["detail"] for row in gate_rows if row["required"] and not row["passed"]
+                )
+            center.instability_reasons = sorted(set(center.instability_reasons))
+            evidence = {
+                **evidence,
+                "stable_region_id": center.stable_region_id,
+                "stable_region_size": center.stable_region_size,
+                "raw_region_stable": raw_region_stable,
+                "changed_profile": changed_profile,
+                "global_instability_reasons": list(global_instability),
+                "eligible_for_changed_recommendation": eligible,
+                "region_selection_reason": region_reason,
+                "score_policy_results": policy_rows,
+                "pareto": pareto_row,
+                "boundary": boundary_result,
+                "continuity_blocks": continuity_result,
+                "moving_block": moving_result,
+                "assumption_stress": stress_result,
+                "walk_forward": walk_result,
+                "selection_bootstrap": selection_result,
+                "recommendation_gates": gate_rows,
             }
-            for row in leave_one_day_out_selection_rows
+            robustness_evidence.append(evidence)
+            leave_one_out_by_key[center_key] = leave_one_out
+            if eligible:
+                eligible_centers.append((center, region_reason, evidence))
+
+
+        def robust_order(
+            item: tuple[MarketReplayCandidateSummary, str, dict[str, Any]],
+        ) -> tuple[Any, ...]:
+            center, _, evidence = item
+
+            def finite_or_negative(value: Any) -> float:
+                try:
+                    number = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return -math.inf
+                return number if math.isfinite(number) else -math.inf
+
+            return (
+                -finite_or_negative(
+                    (evidence.get("walk_forward") or {}).get("fixed_worst_delta")
+                ),
+                -finite_or_negative(
+                    (evidence.get("selection_bootstrap") or {}).get("ci80_low")
+                ),
+                -finite_or_negative(
+                    (evidence.get("moving_block") or {}).get("ci80_low")
+                ),
+                -finite_or_negative(evidence.get("bootstrap_ci80_low")),
+                -finite_or_negative(evidence.get("leave_one_day_out_min_delta")),
+                -finite_or_negative(evidence.get("atr_phase_adverse_score_delta")),
+                -finite_or_negative(evidence.get("atr_phase_min_score_delta")),
+                -finite_or_negative(evidence.get("observed_score_delta")),
+                -center.score,
+                -center.stable_region_size,
+                _profile_distance(center.profile),
+                center.profile.key(),
+            )
+
+        _emit(progress, "Post-Stage 3: selecting final recommendation", 0, 1)
+        eligible_centers.sort(key=robust_order)
+        chosen: MarketReplayCandidateSummary | None = None
+        chosen_reason = ""
+        if eligible_centers:
+            chosen, region_reason, _ = eligible_centers[0]
+            chosen_reason = (
+                f"{region_reason} The candidate passed every required source-quality, paired, bootstrap, "
+                "leave-one-day-out, ATR-phase, score-policy, Pareto, search-boundary, economic-continuity, "
+                "assumption-stress, selection-aware out-of-bag, and chronological walk-forward gate against "
+                "the unchanged BouncyBot control."
+            )
+
+        if chosen is None:
+            chosen = control_summary
+            chosen.evidence_stable = False
+            control_selection = _selection_stability(
+                control_profile,
+                leave_one_day_out_selection_rows,
+            )
+            chosen.leave_one_day_out_selection_runs = int(
+                control_selection.get("selection_runs") or 0
+            )
+            chosen.leave_one_day_out_exact_profile_selections = int(
+                control_selection.get("exact_profile_selections") or 0
+            )
+            chosen.leave_one_day_out_exact_profile_selection_pct = (
+                control_selection.get("exact_profile_selection_pct")
+            )
+            chosen.leave_one_day_out_same_window_selections = int(
+                control_selection.get("same_atr_window_selections") or 0
+            )
+            chosen.leave_one_day_out_same_window_selection_pct = (
+                control_selection.get("same_atr_window_selection_pct")
+            )
+            if all(candidate.sessions_with_trades == 0 for candidate in candidates):
+                chosen_reason = (
+                    "No searched profile completed a simulated trade. No data-supported ATR change was found; "
+                    "the unchanged BouncyBot control is displayed for reference."
+                )
+                chosen.instability_reasons.append(
+                    "No candidate produced a simulated trade in the recorded data."
+                )
+            elif global_instability:
+                chosen_reason = (
+                    "A changed profile cannot be recommended because the recording failed one or more source-quality "
+                    "stability gates. No data-supported ATR change was found; the unchanged BouncyBot control is "
+                    "displayed for reference."
+                )
+            elif region_centers:
+                chosen_reason = (
+                    "No changed stable-region center passed every recommendation authorization gate, including "
+                    "paired outcomes, day and moving-block bootstrap, exact leave-one-day-out reselection, ATR phase, "
+                    "score-policy stability, Pareto non-domination, resolved search boundaries, assumption stress, "
+                    "selection-aware out-of-bag bootstrap, and chronological walk-forward validation. No data-supported "
+                    "ATR change was found; the unchanged BouncyBot control is displayed for reference."
+                )
+            else:
+                chosen_reason = (
+                    "No supported adjacent near-best multiplier region was found. No data-supported ATR change was found; "
+                    "the unchanged BouncyBot control is displayed for reference."
+                )
+            chosen.instability_reasons.extend(
+                [
+                    "No changed profile passed every default robustness gate.",
+                    *global_instability,
+                ]
+            )
+            chosen.instability_reasons = sorted(set(chosen.instability_reasons))
+            recommendation_leave_one_out = [
+                {
+                    "candidate_profile_key": control_profile.key(),
+                    "control_profile_key": control_profile.key(),
+                    "omitted_trading_day": row["omitted_trading_day"],
+                    "remaining_trading_days": max(
+                        0,
+                        len(leave_one_day_out_selection_rows) - 1,
+                    ),
+                    "score_delta": 0.0,
+                    **row,
+                }
+                for row in leave_one_day_out_selection_rows
+            ]
+        else:
+            recommendation_leave_one_out = leave_one_out_by_key.get(
+                chosen.profile.key(),
+                [],
+            )
+
+        _emit(progress, "Post-Stage 3: selecting final recommendation", 1, 1)
+        _emit(progress, "Post-Stage 3: generating detailed profile evidence", 0, 1)
+        if chosen.profile.key() == control_profile.key():
+            control_detail, detailed_control_sessions, control_trades = _evaluate_profile(
+                recording,
+                period_ticks,
+                atr_cache,
+                control_profile,
+                normalized,
+                keep_details=True,
+            )
+            _copy_selection_evidence(chosen, control_detail)
+            summaries[control_profile.key()] = control_detail
+            recommendation = control_detail
+            recommended_sessions = detailed_control_sessions
+            recommended_trades = control_trades
+        else:
+            recommendation, recommended_sessions, recommended_trades = _evaluate_profile(
+                recording,
+                period_ticks,
+                atr_cache,
+                chosen.profile,
+                normalized,
+                keep_details=True,
+            )
+            _copy_selection_evidence(chosen, recommendation)
+            summaries[chosen.profile.key()] = recommendation
+
+            control_detail, detailed_control_sessions, _ = _evaluate_profile(
+                recording,
+                period_ticks,
+                atr_cache,
+                control_profile,
+                normalized,
+                keep_details=True,
+            )
+            _copy_selection_evidence(control_summary, control_detail)
+            summaries[control_profile.key()] = control_detail
+
+        _emit(progress, "Post-Stage 3: generating detailed profile evidence", 1, 1)
+        _emit(progress, "Finalizing Market Replay evidence", 0, 1)
+        candidates = sorted(
+            (summaries[key] for key in stage3_keys),
+            key=_candidate_sort_key,
+        )
+        contract = market_replay_search_contract(requested_config)
+        contract["cost_and_liquidity_model"].update(
+            {
+                "configured_assumed_trade_notional": (
+                    calibration.configured_trade_notional
+                ),
+                "effective_assumed_trade_notional": calibration.effective_trade_notional,
+                "configured_execution_cost_bps_per_side": (
+                    calibration.configured_execution_cost_bps_per_side
+                ),
+                "effective_execution_cost_bps_per_side": (
+                    calibration.effective_execution_cost_bps_per_side
+                ),
+            }
+        )
+        contract["execution_calibration"]["result"] = calibration.to_dict()
+        fingerprint_payload = {
+            "input_components": recording.input_components,
+            "search_contract": contract,
+            "execution_calibration": calibration.to_dict(),
+        }
+        analysis_id = hashlib.sha256(canonical_json_bytes(fingerprint_payload)).hexdigest()
+        output_dir = normalized.output_root / f"market_replay_{analysis_id[:16]}"
+        issues = list(recording.issues)
+        issues.extend(
+            f"Execution calibration: {warning}" for warning in calibration.warnings
+        )
+        issues.append(f"Protective SELL policy screen: {protective_policy_reason}")
+        observed_durations = [
+            max(
+                0.0,
+                (ticks[-1].elapsed_ns - ticks[0].elapsed_ns) / 1_000_000_000.0,
+            )
+            for _, ticks in period_ticks
+            if ticks
         ]
-    else:
-        recommendation_leave_one_out = leave_one_out_by_key.get(
-            chosen.profile.key(),
-            [],
+        shortest_warmup = min(
+            (period + 1) * bar_seconds
+            for period in _STAGE2_PERIODS
+            for bar_seconds in _STAGE1_BAR_SECONDS
+        )
+        if not observed_durations or max(observed_durations) < shortest_warmup:
+            issues.append(
+                "Every analyzable session is shorter than the smallest configured ATR warm-up window; no data-derived ATR trade can be expected."
+            )
+        if trading_day_count < _MIN_ROBUST_TRADING_DAYS:
+            issues.append(
+                f"Fewer than {_MIN_ROBUST_TRADING_DAYS} analyzable RTH trading days are present; a changed profile cannot pass the default day-level robustness gate."
+            )
+        issues.extend(global_instability)
+        continuity_evidence = [
+            {
+                "session_date": session.session_date,
+                "period_id": session.period_id,
+                "continuity_chain_id": session.continuity_chain_id,
+                "continuity_broken_before": session.continuity_broken_before,
+                "continuity_break_reason": session.continuity_break_reason,
+                "carried_position_in": session.carried_position_in,
+                "carried_position_out": session.carried_position_out,
+                "carried_sell_trail_in": session.carried_sell_trail_in,
+                "carried_sell_trail_out": session.carried_sell_trail_out,
+                "carried_protective_trail_in": session.carried_protective_trail_in,
+                "carried_protective_trail_out": session.carried_protective_trail_out,
+                "protective_trigger_pending_at_end": (
+                    session.protective_trigger_pending_at_end
+                ),
+                "terminal_open_position": session.terminal_open_position,
+                "session_start_equity": session.session_start_equity,
+                "session_end_equity": session.session_end_equity,
+                "cumulative_end_equity": session.cumulative_end_equity,
+                "overnight_gap_return_bps": session.overnight_gap_return_bps,
+            }
+            for session in recommended_sessions
+        ]
+        _emit(progress, "Finalizing Market Replay evidence", 1, 1)
+        _emit(progress, "Market Replay analysis complete", 1, 1)
+        return MarketReplayAnalysisResult(
+            run_id=f"market-replay-{analysis_id[:16]}",
+            analysis_id=analysis_id,
+            output_dir=output_dir,
+            generated_at_utc=recording.data_end_utc,
+            recording=recording,
+            recommendation=recommendation,
+            recommendation_reason=chosen_reason,
+            candidates=candidates,
+            recommended_sessions=recommended_sessions,
+            recommended_trades=recommended_trades,
+            control=control_detail,
+            control_sessions=detailed_control_sessions,
+            global_issues=sorted(set(issues)),
+            search_contract=contract,
+            window_search=window_search,
+            robustness_evidence=robustness_evidence,
+            recommendation_leave_one_day_out=recommendation_leave_one_out,
+            session_quality=session_quality,
+            execution_calibration=calibration.to_dict(),
+            continuity_evidence=continuity_evidence,
+            continuity_block_evidence=continuity_block_evidence,
+            score_policy_evidence=score_policy_evidence,
+            moving_block_evidence=moving_block_evidence,
+            selection_bootstrap_evidence=selection_bootstrap_evidence,
+            walk_forward_evidence=walk_forward_evidence,
+            pareto_evidence=pareto_evidence,
+            boundary_evidence=boundary_evidence,
+            assumption_stress_evidence=assumption_stress_evidence,
+            recommendation_gates=recommendation_gate_evidence,
+            protective_policy_evidence=protective_policy_evidence,
+            exploratory_only=exploratory_only,
         )
 
-    if chosen.profile.key() == control_profile.key():
-        control_detail, detailed_control_sessions, control_trades = _evaluate_profile(
-            recording,
-            period_ticks,
-            atr_cache,
-            control_profile,
-            normalized,
-            keep_details=True,
-        )
-        _copy_selection_evidence(chosen, control_detail)
-        summaries[control_profile.key()] = control_detail
-        recommendation = control_detail
-        recommended_sessions = detailed_control_sessions
-        recommended_trades = control_trades
-    else:
-        recommendation, recommended_sessions, recommended_trades = _evaluate_profile(
-            recording,
-            period_ticks,
-            atr_cache,
-            chosen.profile,
-            normalized,
-            keep_details=True,
-        )
-        _copy_selection_evidence(chosen, recommendation)
-        summaries[chosen.profile.key()] = recommendation
-
-        control_detail, detailed_control_sessions, _ = _evaluate_profile(
-            recording,
-            period_ticks,
-            atr_cache,
-            control_profile,
-            normalized,
-            keep_details=True,
-        )
-        _copy_selection_evidence(control_summary, control_detail)
-        summaries[control_profile.key()] = control_detail
-
-    candidates = sorted(
-        (summaries[key] for key in stage3_keys),
-        key=_candidate_sort_key,
-    )
-    contract = market_replay_search_contract(requested_config)
-    contract["cost_and_liquidity_model"].update(
-        {
-            "configured_assumed_trade_notional": (
-                calibration.configured_trade_notional
-            ),
-            "effective_assumed_trade_notional": calibration.effective_trade_notional,
-            "configured_execution_cost_bps_per_side": (
-                calibration.configured_execution_cost_bps_per_side
-            ),
-            "effective_execution_cost_bps_per_side": (
-                calibration.effective_execution_cost_bps_per_side
-            ),
-        }
-    )
-    contract["execution_calibration"]["result"] = calibration.to_dict()
-    fingerprint_payload = {
-        "input_components": recording.input_components,
-        "search_contract": contract,
-        "execution_calibration": calibration.to_dict(),
-    }
-    analysis_id = hashlib.sha256(canonical_json_bytes(fingerprint_payload)).hexdigest()
-    output_dir = normalized.output_root / f"market_replay_{analysis_id[:16]}"
-    issues = list(recording.issues)
-    issues.extend(
-        f"Execution calibration: {warning}" for warning in calibration.warnings
-    )
-    issues.append(f"Protective SELL policy screen: {protective_policy_reason}")
-    observed_durations = [
-        max(
-            0.0,
-            (ticks[-1].elapsed_ns - ticks[0].elapsed_ns) / 1_000_000_000.0,
-        )
-        for _, ticks in period_ticks
-        if ticks
-    ]
-    shortest_warmup = min(
-        (period + 1) * bar_seconds
-        for period in _STAGE2_PERIODS
-        for bar_seconds in _STAGE1_BAR_SECONDS
-    )
-    if not observed_durations or max(observed_durations) < shortest_warmup:
-        issues.append(
-            "Every analyzable session is shorter than the smallest configured ATR warm-up window; no data-derived ATR trade can be expected."
-        )
-    if trading_day_count < _MIN_ROBUST_TRADING_DAYS:
-        issues.append(
-            f"Fewer than {_MIN_ROBUST_TRADING_DAYS} analyzable RTH trading days are present; a changed profile cannot pass the default day-level robustness gate."
-        )
-    issues.extend(global_instability)
-    continuity_evidence = [
-        {
-            "session_date": session.session_date,
-            "period_id": session.period_id,
-            "continuity_chain_id": session.continuity_chain_id,
-            "continuity_broken_before": session.continuity_broken_before,
-            "continuity_break_reason": session.continuity_break_reason,
-            "carried_position_in": session.carried_position_in,
-            "carried_position_out": session.carried_position_out,
-            "carried_sell_trail_in": session.carried_sell_trail_in,
-            "carried_sell_trail_out": session.carried_sell_trail_out,
-            "carried_protective_trail_in": session.carried_protective_trail_in,
-            "carried_protective_trail_out": session.carried_protective_trail_out,
-            "protective_trigger_pending_at_end": (
-                session.protective_trigger_pending_at_end
-            ),
-            "terminal_open_position": session.terminal_open_position,
-            "session_start_equity": session.session_start_equity,
-            "session_end_equity": session.session_end_equity,
-            "cumulative_end_equity": session.cumulative_end_equity,
-            "overnight_gap_return_bps": session.overnight_gap_return_bps,
-        }
-        for session in recommended_sessions
-    ]
-    _emit(progress, "Market Replay analysis complete", 1, 1)
-    return MarketReplayAnalysisResult(
-        run_id=f"market-replay-{analysis_id[:16]}",
-        analysis_id=analysis_id,
-        output_dir=output_dir,
-        generated_at_utc=recording.data_end_utc,
-        recording=recording,
-        recommendation=recommendation,
-        recommendation_reason=chosen_reason,
-        candidates=candidates,
-        recommended_sessions=recommended_sessions,
-        recommended_trades=recommended_trades,
-        control=control_detail,
-        control_sessions=detailed_control_sessions,
-        global_issues=sorted(set(issues)),
-        search_contract=contract,
-        window_search=window_search,
-        robustness_evidence=robustness_evidence,
-        recommendation_leave_one_day_out=recommendation_leave_one_out,
-        session_quality=session_quality,
-        execution_calibration=calibration.to_dict(),
-        continuity_evidence=continuity_evidence,
-        continuity_block_evidence=continuity_block_evidence,
-        score_policy_evidence=score_policy_evidence,
-        moving_block_evidence=moving_block_evidence,
-        selection_bootstrap_evidence=selection_bootstrap_evidence,
-        walk_forward_evidence=walk_forward_evidence,
-        pareto_evidence=pareto_evidence,
-        boundary_evidence=boundary_evidence,
-        assumption_stress_evidence=assumption_stress_evidence,
-        recommendation_gates=recommendation_gate_evidence,
-        protective_policy_evidence=protective_policy_evidence,
-        exploratory_only=exploratory_only,
-    )
+    try:
+        return complete_analysis(prepared_store, batch_evaluator)
+    finally:
+        analysis_stack.close()

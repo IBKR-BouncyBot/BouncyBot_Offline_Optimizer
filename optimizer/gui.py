@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -372,6 +373,17 @@ class MainWindow(QMainWindow):
             "Additional screening-score penalty per completed cycle to discourage turnover-driven zero-trail profiles."
         )
         form.addRow("Turnover penalty", self.ibrec_turnover_spin)
+
+        self.ibrec_workers_spin = QSpinBox()
+        self.ibrec_workers_spin.setRange(0, 64)
+        self.ibrec_workers_spin.setValue(0)
+        self.ibrec_workers_spin.setSpecialValueText("Automatic")
+        self.ibrec_workers_spin.setToolTip(
+            "Worker processes used for independent Stage 3 profiles and outward boundary probes. "
+            "Automatic uses up to eight logical processors while leaving one processor available; "
+            "set 1 to disable multiprocessing. Worker count does not change calculations or reports."
+        )
+        form.addRow("Profile-evaluation workers", self.ibrec_workers_spin)
         layout.addLayout(form)
 
         status_row = QHBoxLayout()
@@ -632,6 +644,7 @@ class MainWindow(QMainWindow):
                 if self.calibration_source_edit.text().strip()
                 else None
             ),
+            worker_processes=self.ibrec_workers_spin.value(),
         )
 
     @Slot()
@@ -703,7 +716,8 @@ class MainWindow(QMainWindow):
             f"Recordings: {len(sources)}\nOutput: {output}\n"
             f"Assumed notional: {self.ibrec_notional_spin.value():,.2f}\n"
             f"Execution-cost reserve: {self.ibrec_cost_spin.value():.4f} bps per side\n"
-            f"Turnover penalty: {self.ibrec_turnover_spin.value():.4f} score points per completed trade\n\nContinue?",
+            f"Turnover penalty: {self.ibrec_turnover_spin.value():.4f} score points per completed trade\n"
+            f"Profile workers: {'Automatic' if self.ibrec_workers_spin.value() == 0 else self.ibrec_workers_spin.value()}\n\nContinue?",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -750,6 +764,7 @@ class MainWindow(QMainWindow):
             self.ibrec_notional_spin,
             self.ibrec_cost_spin,
             self.ibrec_turnover_spin,
+            self.ibrec_workers_spin,
             self.calibration_source_edit,
             self.calibration_source_button,
             self.calibration_source_clear_button,

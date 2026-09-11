@@ -185,3 +185,42 @@ Version 2.0 adds focused coverage for:
 
 The final native Windows gate remains responsible for Ruff, Pyright, PySide6
 thread/UI behavior, and the reproducible two-pass PyInstaller executable build.
+
+Version 2.0.2 adds regression coverage proving that Market Replay accepts more
+than the former 64-recording ceiling, accepts aggregate row totals above the
+former 2,000,000-row ceiling, omits the retired terminal flags, exposes no
+hidden count fields in `MarketReplayConfig`, and carries the unlimited policy
+into analysis-contract evidence.
+
+## v2.1 exact replay-performance tests
+
+Version 2.1 adds regression coverage for the execution engine rather than a new
+analytical method. The tests require:
+
+- compact tick arrays to preserve every replay-relevant timestamp, price,
+  quote-size, snapshot, and event flag;
+- the original object evaluator, compact single-process evaluator, and spawned
+  process evaluator to produce identical candidate and session dictionaries;
+- one-worker and multi-worker complete analyses to have the same analysis ID,
+  search contract, candidates, and recommendation;
+- complete reports generated with different worker counts to be byte-identical;
+- worker count to be validated but excluded from analytical identity;
+- a worker exception to abort analysis rather than omit a batch;
+- NumPy to be a declared runtime dependency and pinned in the reproducible
+  Windows lock;
+- `multiprocessing.freeze_support()` to run before the packaged application
+  entry point;
+- temporary memory maps to close before their directories are removed;
+- deterministic profile-key ordering after out-of-order worker completion.
+
+Version 2.3 extends those execution-only requirements to post-search
+validation. Tests require one pool instance to survive profile evaluation and
+high-level task submission; exact leave-one-day-out selector rows, ATR phase
+evidence, assumption-stress evidence, walk-forward folds, and selection-aware
+bootstrap results to match their serial paths; task results to be restored in
+request order; worker failure to abort; and post-Stage-3 progress to name the
+active operation with completed and pending counts.
+
+A reproducible benchmark helper compares exact one-worker and multi-worker
+runs. Performance measurements are informational and cannot replace the
+result-equivalence assertions.

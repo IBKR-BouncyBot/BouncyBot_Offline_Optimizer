@@ -1,12 +1,13 @@
 [project]
 name = "bouncybot-offline-optimizer"
-version = "1.9.2"
+version = "2.3.1"
 description = "Read-only BouncyBot trade-data analysis and standalone Market Replay ATR optimization"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.7,<7",
+    "numpy>=2.3,<3",
     "tzdata>=2025.2",
 ]
 

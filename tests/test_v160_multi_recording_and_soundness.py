@@ -136,12 +136,10 @@ def test_config_accepts_an_immutable_recording_set_and_rejects_duplicates(
     )
     with pytest.raises(ValueError, match="same Market Replay path"):
         MarketReplayConfig((first, first), tmp_path / "reports").normalized()
-    with pytest.raises(ValueError, match="At most 1"):
-        MarketReplayConfig(
-            (first, second),
-            tmp_path / "reports",
-            max_recordings=1,
-        ).normalized()
+
+    many_paths = tuple(tmp_path / f"recording-{index:03d}.ibrec" for index in range(128))
+    many = MarketReplayConfig(many_paths, tmp_path / "many-reports").normalized()
+    assert len(many.recording_paths) == 128
 
 
 def test_five_daily_recordings_combine_and_are_input_order_independent(
@@ -342,19 +340,15 @@ def test_pre_entry_bid_is_not_reused_to_mark_a_later_open_position(
     assert session.marked_return_bps == session.realized_return_bps
 
 
-def test_recording_set_enforces_aggregate_row_limit_during_preflight_and_load(
+def test_recording_set_has_no_aggregate_row_limit_during_preflight_and_load(
     tmp_path: Path,
 ) -> None:
     paths = _daily_recordings(tmp_path / "recordings", days=2)
-    config = MarketReplayConfig(
-        tuple(paths),
-        tmp_path / "reports",
-        max_rows=200,
-    )
-    with pytest.raises(IbrecError, match="aggregate limit"):
-        inspect_ibrec_set(config)
-    with pytest.raises(IbrecError, match="aggregate limit"):
-        load_ibrec_set(config)
+    config = MarketReplayConfig(tuple(paths), tmp_path / "reports")
+    details = inspect_ibrec_set(config)
+    recording = load_ibrec_set(config)
+    assert details["row_count"] > 200
+    assert recording.raw_row_count == details["row_count"]
 
 
 def test_right_censored_or_unmarked_pairs_cannot_support_a_changed_profile() -> None:

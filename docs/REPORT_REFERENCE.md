@@ -183,3 +183,9 @@ Recovery and avoided-loss fields are descriptive hindsight diagnostics. They
 are deliberately excluded from the candidate score and recommendation gates.
 A blank value means the verified continuity chain did not provide the required
 future executable bid evidence.
+
+## Market Replay input-capacity fields
+
+From v2.0.2 onward, the Market Replay search contract records
+`recording_count_limit` and `aggregate_row_limit` as `null`. Reports still
+record the aggregate input-byte safeguard and all actual input/row counts.

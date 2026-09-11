@@ -454,7 +454,7 @@ def test_release_lock_gitignore_license_and_build_contracts() -> None:
 
     build = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
     assert '$requiredPythonVersion = "3.11.9"' in build
-    assert '$sourceDateEpoch = "1785024000"' in build
+    assert '$sourceDateEpoch = "1787788800"' in build
     assert "requirements-release-win64.lock" in build
     assert "--no-deps" in build
     assert "--only-binary=:all:" in build
