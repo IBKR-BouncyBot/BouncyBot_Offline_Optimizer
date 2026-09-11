@@ -28,7 +28,10 @@ User confirmation
   -> atomically publish or byte-verify the content-addressed HTML/JSON/CSV report
 ```
 
-The core analysis uses only the Python standard library. PySide6 is isolated to `optimizer/gui.py`; terminal mode and the core automated suite can run without Qt.
+The SQLite/capture analysis core uses only the Python standard library. The
+Market Replay performance engine additionally uses NumPy for compact,
+file-backed arrays. PySide6 is isolated to `optimizer/gui.py`; terminal mode
+and the non-GUI automated suite can run without Qt.
 
 ## Modules
 
@@ -39,6 +42,8 @@ The core analysis uses only the Python standard library. PySide6 is isolated to 
 - `atr.py`: fixed-time OHLC bars, true range, simple-average ATR, candidate windows, clamps, and chronological historical-window fallback.
 - `replay.py`: native trailing BUY and chronological normal-SELL activation/trail capture-window simulations; explicit trigger/censoring outcomes; quote context; pooled and historical-profile subgroup metrics.
 - `evidence.py`: empirical execution adjustment, identical-cycle pairing, Kaplan-Meier trigger probabilities, deterministic trading-day bootstrap, leave-one-day-out influence, stability gates, and adjacent-region detection.
+- `market_replay_fast.py`: exact compact replay arrays, file-backed ATR arrays,
+  spawned process workers, deterministic profile batching, and worker cleanup.
 - `analysis.py`: ticker association, fill recovery, protective-exit separation, coverage grading, candidate generation, conservative primary-profile selection, and end-to-end source consistency checks.
 - `determinism.py`: canonical serialization, input fingerprint, content-based run identity, and evidence-derived data-through timestamp.
 - `presentation.py`: testable GUI column definitions, row-specific tooltips, and per-ticker report paths.
@@ -94,7 +99,7 @@ Format 3 is opened only after the source and any rollback journal have been copi
 
 The format-3 lifecycle model deliberately accepts a committed RTH period left `active` by hard termination. A missing committed period end is derived conservatively from committed ticks and remains right-censored. Event order is based on sequence and monotonic `elapsed_ns`; recorder wall-clock reversals are retained as quality evidence and disable the stable-evidence label rather than reordering rows.
 
-The importer validates all raw rows before applying a semantic replay projection. That projection can remove only redundant size/volume/high-low updates; it retains every Last event, full snapshot, price/feed change, first/final row, and at least one usable state per UTC second. This keeps candidate memory bounded without allowing a discarded row to alter ATR, trigger, stop-normalization, fill, or feed semantics.
+The importer validates all raw rows before applying a semantic replay projection. The Market Replay workflow has no hard recording-count or row-count ceiling; available memory and runtime are the practical capacity limits. Byte-size, archive-expansion, member, field, integrity, duplicate-input, and mutation safeguards remain fail-closed. The semantic projection can remove only redundant size/volume/high-low updates; it retains every Last event, full snapshot, price/feed change, first/final row, and at least one usable state per UTC second. This reduces candidate memory without allowing a discarded row to alter ATR, trigger, stop-normalization, fill, or feed semantics.
 
 The GUI owns one tab per workflow and one global worker slot. A run in either tab disables both tabs until the worker exits, preventing overlapping CPU- and disk-intensive analyses inside one process while preserving independent input, progress, result, and report controls.
 
@@ -116,7 +121,14 @@ Release reproducibility is also separated from application analysis. The Windows
 
 ## v1.6 multi-recording and recommendation-soundness boundary
 
-The Market Replay input boundary accepts an immutable set of at most 64 `.ibrec` paths. Every file is copied and verified independently before combination. The combiner requires matching symbol, positive conId, currency, security type, exchange time zone, and minimum tick. Content-identical inputs are rejected. Exchange-routing metadata may differ only when the stronger instrument identity agrees, and that difference is reported.
+The Market Replay input boundary accepts an immutable set of `.ibrec` paths.
+Version 2.0.2 removed the former 64-file and row-count ceilings; byte/archive
+integrity safeguards and available resources remain the practical limits.
+Every file is copied and verified independently before combination. The
+combiner requires matching symbol, positive conId, currency, security type,
+exchange time zone, and minimum tick. Content-identical inputs are rejected.
+Exchange-routing metadata may differ only when the stronger instrument
+identity agrees, and that difference is reported.
 
 The combined dataset contains at most one RTH period per trading date. When verified same-date fragments have compatible schedules, a deterministic interval selector maximizes observed wall-clock coverage first, then live-only coverage, normal-close evidence, retained strategy rows, fewer stitches, and a content-derived tie-break. Selected fragments are rebased onto one strictly increasing monotonic clock while preserving their real wall-clock outage, so ATR freshness, quote age, event gaps, and Last-density checks see the interruption. Overlapping streams are never interleaved, and conflicting scheduled RTH boundaries exclude the date. Combined identities use only component roles, sizes, hashes, formats, and canonical ordering, so input order, source path, and filename do not alter the result.
 
@@ -180,3 +192,50 @@ ATR control with protective SELL disabled.
 protective exits. Post-exit recovery and avoided-loss diagnostics are generated
 only after detailed replay and never feed candidate ranking, preventing
 hindsight diagnostics from becoming a selection input.
+
+## v2.3 analysis-wide parallel replay boundary
+
+Version 2.1 added `optimizer.market_replay_fast` as an execution-only boundary
+around independent Stage 3 profile replay. Version 2.3 extends the lifetime of
+that same boundary through the expensive post-search validation. The validated `IbrecTick` and ATR
+objects remain the authoritative evidence. Before broad Stage 3 evaluation,
+the parent process projects their replay-relevant fields into temporary
+read-only NumPy `.npy` arrays. Every compact session retains sequence,
+monotonic time, exact receipt milliseconds, selected strategy price, validated
+bid/ask, Last/mark, touch sizes, and genuine event flags. ATR arrays are keyed
+by the same recording/session/period/window identity as the existing cache.
+
+One persistent spawned process pool attaches to those files. During Stage 3,
+workers receive profile batches and return candidate/session summaries. After
+Stage 3, they receive deterministic high-level tasks for exact leave-one-day-out
+selector reruns, fixed-profile omissions, selection-aware bootstrap replicates,
+walk-forward folds, ATR phase variants, and assumption-stress scenarios. Each
+task executes its own complete chronological replay serially; workers never
+create nested pools. Candidate generation, bootstrap schedules, ranking,
+stable-region construction, boundary decisions, authorization, and report
+writing remain in the deterministic parent process.
+
+Every high-level task has a stable identifier. Results are restored in caller
+order rather than completion order. Missing, duplicate, unexpected, or
+mismatched identifiers abort analysis. The same process pool is closed only
+after recommendation authorization has completed.
+
+Automatic mode keeps fewer than 50,000 retained rows on the original object
+evaluator. At or above that threshold it uses the compact arrays, leaves one
+logical processor free, and applies a memory-aware automatic ceiling of up to
+16 workers. An explicit
+value of one uses compact arrays without multiprocessing at any size; values
+2-64 request a spawned worker count. Worker count is excluded from the analysis
+contract and report identity. Any worker exception propagates and aborts
+analysis; the parent never accepts a partial candidate set.
+
+The same release updates drawdown online in the original chronological order,
+uses exact last-sampled-second counters for clamp evidence, and avoids repeated
+configuration normalization in the compact evaluator. Reference-engine,
+compact-serial, compact-parallel, and report-byte equivalence tests enforce
+that this boundary changes execution cost only, not formulas or results.
+
+Progress is operation-specific after Stage 3. The GUI receives an explicit
+Stage-3 completion transition and then named progress for leave-one-out,
+phase, stress, walk-forward, and selection-aware bootstrap work, including
+worker mode and pending-task counts.

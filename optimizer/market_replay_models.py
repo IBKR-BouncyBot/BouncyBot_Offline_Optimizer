@@ -59,10 +59,8 @@ class MarketReplayConfig:
 
     recording_path: Path | tuple[Path, ...]
     output_root: Path
-    max_rows: int = 2_000_000
     max_input_bytes: int = 4 * 1024 * 1024 * 1024
     max_zip_uncompressed_bytes: int = 8 * 1024 * 1024 * 1024
-    max_recordings: int = 64
     min_atr_pct: float = 0.10
     max_atr_pct: float = 20.00
     assumed_trade_notional: float = 10_000.0
@@ -88,6 +86,10 @@ class MarketReplayConfig:
     calibration_use_execution_cost: bool = True
     calibration_use_trade_notional: bool = True
     protective_policy_search_enabled: bool = True
+    # 0 selects a bounded automatic process count.  One disables
+    # multiprocessing.  The value is an execution preference only and is
+    # deliberately excluded from content-addressed analytical identity.
+    worker_processes: int = 0
 
     @property
     def recording_paths(self) -> tuple[Path, ...]:
@@ -112,17 +114,8 @@ class MarketReplayConfig:
                 key=lambda item: str(item).casefold(),
             )
         )
-        max_recordings = _strict_positive_int(
-            self.max_recordings,
-            name="max_recordings",
-            minimum=1,
-        )
         if not paths:
             raise ValueError("Select at least one Market Replay .ibrec recording.")
-        if len(paths) > max_recordings:
-            raise ValueError(
-                f"At most {max_recordings:,} Market Replay recordings can be analyzed together."
-            )
         if len(set(paths)) != len(paths):
             raise ValueError("The same Market Replay path was selected more than once.")
         output = Path(self.output_root).expanduser().resolve()
@@ -133,7 +126,6 @@ class MarketReplayConfig:
                 raise ValueError(
                     "Market Replay output cannot replace or be nested under an input file."
                 )
-        max_rows = _strict_positive_int(self.max_rows, name="max_rows", minimum=100)
         max_input_bytes = _strict_positive_int(
             self.max_input_bytes,
             name="max_input_bytes",
@@ -151,8 +143,14 @@ class MarketReplayConfig:
                 raise ValueError(f"{name} must be a finite non-negative number.")
             return number
 
-        minimum = finite_nonnegative(self.min_atr_pct, name="min_atr_pct")
-        maximum = finite_nonnegative(self.max_atr_pct, name="max_atr_pct")
+        # The clamps are rounded before they are validated because the exact
+        # two-decimal value is what is stored, replayed, and rendered into
+        # ``AtrProfile.key()``.  Validating the raw value and storing a
+        # higher-precision one would accept a configuration whose profiles
+        # cannot be told apart by their own identity, and would also accept a
+        # minimum/maximum pair that collapses onto a single value once rounded.
+        minimum = round(finite_nonnegative(self.min_atr_pct, name="min_atr_pct"), 2)
+        maximum = round(finite_nonnegative(self.max_atr_pct, name="max_atr_pct"), 2)
         # BouncyBot itself applies an absolute 0.01% lower bound and a 99.99%
         # upper bound before rounding strategy percentages to two decimals.
         # Accepting values outside that actionable range would let the
@@ -346,6 +344,9 @@ class MarketReplayConfig:
             name="calibration_min_samples",
             minimum=1,
         )
+        worker_processes = finite_int(self.worker_processes)
+        if worker_processes is None or worker_processes < 0 or worker_processes > 64:
+            raise ValueError("worker_processes must be an integer between 0 and 64.")
         calibration_source = (
             Path(self.calibration_source_dir).expanduser().resolve()
             if self.calibration_source_dir is not None
@@ -360,15 +361,13 @@ class MarketReplayConfig:
                 raise ValueError(
                     "Market Replay output cannot replace or be nested under the calibration source directory."
                 )
-        return MarketReplayConfig(
+        normalized = MarketReplayConfig(
             recording_path=paths,
             output_root=output,
-            max_rows=max_rows,
             max_input_bytes=max_input_bytes,
             max_zip_uncompressed_bytes=max_zip_uncompressed_bytes,
-            max_recordings=max_recordings,
-            min_atr_pct=round(minimum, 4),
-            max_atr_pct=round(maximum, 4),
+            min_atr_pct=minimum,
+            max_atr_pct=maximum,
             assumed_trade_notional=round(assumed_notional, 2),
             execution_cost_bps_per_side=round(execution_cost, 4),
             buy_execution_cost_bps_per_side=round(buy_execution_cost, 6),
@@ -408,7 +407,9 @@ class MarketReplayConfig:
                 self.protective_policy_search_enabled,
                 name="protective_policy_search_enabled",
             ),
+            worker_processes=worker_processes,
         )
+        return normalized
 
 
 @dataclass(slots=True, frozen=True)
@@ -463,6 +464,16 @@ class IbrecTick:
         """Return whether this row can represent a new Last-trigger event."""
 
         return self.full_snapshot or "last" in self.changed_fields
+
+    def has_bid_event(self) -> bool:
+        """Return whether this row refreshed the bid-side quote state."""
+
+        return self.full_snapshot or "bid" in self.changed_fields
+
+    def has_ask_event(self) -> bool:
+        """Return whether this row refreshed the ask-side quote state."""
+
+        return self.full_snapshot or "ask" in self.changed_fields
 
     def valid_bid(self) -> float | None:
         """Return a usable bid, excluding a crossed two-sided quote."""
@@ -646,22 +657,71 @@ class AtrProfile:
             raise ValueError(
                 "protective_sell_mode must be 'disabled', 'manual', or 'atr'."
             )
-        value = finite_float(self.protective_sell_value)
-        if value is None:
-            raise ValueError("protective_sell_value must be finite.")
+        # ``key()`` renders every float field below with two decimals and is the
+        # identity used for the summary/session dictionaries, the equivalence
+        # catalog, the stable-region hash, and the bootstrap seed.  Retaining
+        # more precision than that identity can express lets two distinct
+        # profiles share one nominal key, which silently shrinks the searched
+        # grid in the reference engine and aborts the compact engine.  BouncyBot
+        # itself only accepts two-decimal strategy percentages and multipliers,
+        # so normalizing here - at the one object every producer constructs -
+        # keeps the stored value, the key, the report, and the trading
+        # application in exact agreement.
+        normalized: dict[str, float] = {}
+        for name in (
+            "protective_sell_value",
+            "initial_drop_multiplier",
+            "buy_rebound_multiplier",
+            "minimum_profit_multiplier",
+            "sell_trail_multiplier",
+            "min_atr_pct",
+            "max_atr_pct",
+        ):
+            number = finite_float(getattr(self, name))
+            if number is None:
+                raise ValueError(f"AtrProfile {name} must be a finite number.")
+            rounded = round(number, 2)
+            # Canonicalize negative zero.  ``-0.0 == 0.0`` but the two values
+            # render as ``-0.00`` and ``0.00``; retaining the sign would let
+            # equal dataclass values acquire different nominal keys.
+            normalized[name] = 0.0 if rounded == 0.0 else rounded
+
         if mode == "disabled":
-            value = 0.0
+            normalized["protective_sell_value"] = 0.0
         elif mode == "manual":
-            if value < 0.01 or value > 99.99:
+            if not 0.01 <= normalized["protective_sell_value"] <= 99.99:
                 raise ValueError(
                     "Manual protective SELL trail must be between 0.01% and 99.99%."
                 )
-        elif value < 0.01 or value > 50.0:
+        elif not 0.01 <= normalized["protective_sell_value"] <= 50.0:
             raise ValueError(
                 "ATR-adaptive protective SELL multiplier must be between 0.01 and 50."
             )
+
+        multiplier_minimums = {
+            "initial_drop_multiplier": 0.01,
+            "buy_rebound_multiplier": 0.0,
+            "minimum_profit_multiplier": 0.01,
+            "sell_trail_multiplier": 0.0,
+        }
+        for name, minimum in multiplier_minimums.items():
+            value = normalized[name]
+            if value < minimum:
+                raise ValueError(
+                    f"AtrProfile {name} must be at least {minimum:.2f}."
+                )
+
+        minimum_atr = normalized["min_atr_pct"]
+        maximum_atr = normalized["max_atr_pct"]
+        if minimum_atr < 0.01 or maximum_atr > 99.99 or maximum_atr <= minimum_atr:
+            raise ValueError(
+                "AtrProfile ATR clamps must be between 0.01% and 99.99%, "
+                "with max_atr_pct above min_atr_pct."
+            )
+
         object.__setattr__(self, "protective_sell_mode", mode)
-        object.__setattr__(self, "protective_sell_value", round(value, 4))
+        for name, value in normalized.items():
+            object.__setattr__(self, name, value)
 
     @property
     def protective_sell_enabled(self) -> bool:

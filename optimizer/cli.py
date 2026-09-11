@@ -34,6 +34,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--packaged-multiprocessing-smoke-test",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--no-gui", action="store_true", help="Run in the terminal instead of opening the desktop interface")
     parser.add_argument("--source-dir", type=Path, default=default_source_dir(), help="Folder containing bot_state.sqlite and debug_captures")
     parser.add_argument(
@@ -64,12 +69,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json-result", action="store_true", help="Print the final run summary as JSON")
     parser.add_argument(
-        "--max-ibrec-rows",
-        type=int,
-        default=2_000_000,
-        help="Aggregate safety limit for rows across the selected Market Replay recordings",
-    )
-    parser.add_argument(
         "--max-ibrec-mib",
         type=int,
         default=4096,
@@ -80,12 +79,6 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=8192,
         help="Safety limit for total uncompressed content in a version-2 ZIP recording",
-    )
-    parser.add_argument(
-        "--max-ibrec-files",
-        type=int,
-        default=64,
-        help="Maximum number of Market Replay recordings accepted in one analysis",
     )
     parser.add_argument(
         "--ibrec-notional",
@@ -104,6 +97,15 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=0.25,
         help="Additional screening-score penalty per completed simulated trade",
+    )
+    parser.add_argument(
+        "--ibrec-workers",
+        type=int,
+        default=0,
+        help=(
+            "Worker processes for independent Stage 3 profiles and outward boundary probes. "
+            "Use 0 for automatic, 1 for single-process execution, or 2-64 explicitly."
+        ),
     )
     parser.add_argument(
         "--calibration-source-dir",
@@ -240,10 +242,8 @@ def run_market_replay_terminal(args: argparse.Namespace) -> int:
     config = MarketReplayConfig(
         recording_path=tuple(Path(value) for value in raw_inputs),
         output_root=Path(args.output_dir),
-        max_rows=max(100, int(args.max_ibrec_rows)),
         max_input_bytes=max(1, int(args.max_ibrec_mib)) * 1024 * 1024,
         max_zip_uncompressed_bytes=max(1, int(args.max_ibrec_zip_mib)) * 1024 * 1024,
-        max_recordings=max(1, int(args.max_ibrec_files)),
         assumed_trade_notional=float(args.ibrec_notional),
         execution_cost_bps_per_side=float(args.ibrec_cost_bps_per_side),
         turnover_penalty_bps_per_completed_trade=float(
@@ -261,6 +261,7 @@ def run_market_replay_terminal(args: argparse.Namespace) -> int:
         calibration_min_samples=max(1, int(args.calibration_min_samples)),
         calibration_use_execution_cost=not bool(args.no_calibrated_cost),
         calibration_use_trade_notional=not bool(args.no_calibrated_notional),
+        worker_processes=int(args.ibrec_workers),
     )
     if args.calibration_source_dir is not None and not args.yes:
         calibration_root = Path(args.calibration_source_dir).expanduser().resolve()
@@ -319,6 +320,13 @@ def run_market_replay_terminal(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
+    if args.packaged_multiprocessing_smoke_test:
+        try:
+            from .market_replay_fast import packaged_spawn_smoke_test
+
+            return 0 if packaged_spawn_smoke_test() else 5
+        except (OSError, RuntimeError, TimeoutError):
+            return 5
     if args.packaged_smoke_test:
         # Import the complete GUI entry module without creating a QApplication.
         # The Windows build invokes this hidden mode to prove that the frozen
@@ -329,9 +337,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             # nothing extra about the frozen build.
             from .gui import MainWindow
             from .ibrec import inspect_ibrec
+            from .market_replay_fast import PreparedReplayStore
         except ImportError:
             return 5
-        return 0 if MainWindow is not None and inspect_ibrec is not None and write_market_replay_report is not None else 5
+        return (
+            0
+            if MainWindow is not None
+            and inspect_ibrec is not None
+            and PreparedReplayStore is not None
+            and write_market_replay_report is not None
+            else 5
+        )
     if args.no_gui:
         return run_market_replay_terminal(args) if args.ibrec is not None else run_terminal(args)
     try:

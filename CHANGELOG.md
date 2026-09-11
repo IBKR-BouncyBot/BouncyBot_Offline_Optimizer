@@ -1,5 +1,107 @@
 # Changelog
 
+## 2.3.1 — 2026-08-28
+
+Profile-identity and outward-probe correction release.
+
+- Enforces the two-decimal invariant that `AtrProfile.key()` already assumed: every rendered float field is normalized in `__post_init__`, so two distinct profiles can no longer share one nominal key.
+- Validates and stores the Market Replay ATR clamps as the exact two-decimal values that are replayed and reported, instead of validating a raw value and storing four decimals. A minimum/maximum pair that collapses onto one value once rounded is now rejected.
+- Gives the reference evaluation path the same fail-closed duplicate-key guard the compact evaluator already had, so both engines fail identically instead of one silently shrinking the searched grid.
+- Keeps outward search-boundary probes inside BouncyBot's GUI-enterable range: only the BUY-rebound and SELL-trail multipliers may be probed to zero; the initial-drop and minimum-profit multipliers stop at 0.01.
+- Rounds outward probe values to two decimals so a probe is always expressible by the profile key that names it.
+- Canonicalizes negative zero in profile identity, validates rounded candidate floors and clamp ordering, and records the exact post-normalization value in every outward-probe evidence row.
+- Rejects a later profile batch when an already-populated summary key belongs to a different profile.
+- Removes the dead `_subset_candidate` helper, whose cached-session leave-one-day-out approach the exact rework deliberately replaced.
+- No analytical-methodology change: the Market Replay analysis contract remains at version 16, and reports for every previously valid configuration are byte-identical apart from the version string.
+
+## 2.3.0 — 2026-08-28
+
+Analysis-wide process-parallel robustness-validation release.
+
+- Keeps one compact replay store and one spawned process pool alive from Stage 3 through recommendation authorization.
+- Parallelizes exact leave-one-day-out selector reruns, fixed-profile omission replays, selection-aware bootstrap replicates, chronological walk-forward folds, ATR bar-phase replays, and assumption-stress scenarios.
+- Preserves one-profile chronological replay order and prohibits nested process pools.
+- Restores every high-level task result in deterministic caller order and fails closed on missing, duplicate, unexpected, or mismatched task identifiers.
+- Adds explicit post-Stage-3 progress transitions with worker mode, completed count, total count, and pending count.
+- Retains byte-identical serial/parallel analytical output and leaves the Market Replay analysis contract at version 16 because formulas, samples, search space, and authorization semantics are unchanged.
+
+## 2.2.3 — 2026-08-28
+
+Pyright compatibility and replay-resource hardening release.
+
+- Unified the reference and compact replay engines on one minimal read-only ATR-vector protocol, resolving the nine reported Pyright errors for Python lists and NumPy memory maps without weakening the public calculation contract.
+- Replaced platform-specific direct `os.sysconf` typing with a fail-closed optional capability probe and rejected malformed, Boolean, NaN, or infinite ATR values at the shared conversion boundary.
+- Prevented equivalence collapsing when no observed sessions exist; exact behavioral equivalence must now be proven from complete effective-percentage evidence.
+- Bounded the opportunistic scalar memoization used while preparing effective arrays so high-cardinality multi-million-row ATR streams cannot grow an unbounded Python dictionary.
+- Hardened temporary NumPy storage: compact tick files, ATR files, and effective arrays now close memory maps before cleanup, remove failed partial files, close a first map when a paired map fails to open, and release already-opened serial sessions when a later session fails.
+- Ensured evaluator cleanup continues even if process-pool shutdown raises, preventing a worker failure from leaving parent-process mappings open.
+- Added focused regression tests for protocol compatibility, Pyright-sensitive paths, fail-closed memory probing, empty-evidence equivalence, bounded effective-array preparation, and injected serialization/dtype failures.
+
+## 2.2.2 — 2026-08-27
+
+Ruff quality-gate correction and exact refinement acceleration release.
+
+- Removed the unused `dataclasses.replace` import from the refinement-optimization module.
+- Corrected the v2.2 exact-refinement test import ordering required by Ruff 0.16.0.
+- Removed the unused `_atr_cache_key` test import from the deep-audit regression module.
+- Includes the v2.2.0 exact effective-profile equivalence collapsing, shared effective-percentage/clamp-state arrays, adaptive refinement batches, and memory-aware automatic worker ceiling above eight.
+- Includes the v2.2.1 fail-closed nominal-result validation and explicit NumPy memory-map lifecycle hardening.
+- Preserves the complete nominal candidate grid and restores every nominal profile before ranking, stable-region analysis, outward boundary probes, robustness validation, and reporting.
+
+## 2.2.1 — 2026-08-27
+
+Deep performance-engine audit and lifecycle hardening.
+
+- Added fail-closed validation that process scheduling and equivalence expansion return exactly one result for each nominal profile in deterministic order.
+- Explicitly closes parent-process effective-array memory maps before temporary replay-store cleanup, avoiding Windows file-handle retention.
+- Added regression tests for missing/reordered profile results, duplicate nominal profiles, read-only mappings, and deterministic grouping.
+
+## 2.2.0 — 2026-08-27
+
+Exact Stage 3 refinement acceleration.
+
+- Collapses only profiles proven equivalent after exact ATR multiplication, clamp classification, and two-decimal rounding over the complete prepared ATR evidence.
+- Stores effective percentages as exact integer hundredths and clamp states in read-only memory-mapped arrays shared by serial and spawned workers.
+- Restores all nominal profile aliases before candidate ranking and all downstream recommendation logic.
+- Uses smaller adaptive task batches for large recordings and raises the memory-aware automatic worker ceiling from eight to sixteen.
+
+## 2.1.1 — 2026-08-27
+
+Pyright ATR-provider contract and clean-source release.
+
+- Corrected four Pyright 1.1.411 errors introduced by the compact NumPy replay engine. The replay core now accepts one minimal read-only ATR-vector protocol implemented by both ordinary Python lists and read-only NumPy arrays/memory maps.
+- Widened the reference ATR-provider callback parameters from concrete `list[IbrecTick]` values to the same `Sequence[Any]` contract accepted by the replay core. This is a type-contract correction only; the runtime objects, ATR values, indexing order, and calculations are unchanged.
+- Added regression checks for the protocol, callback annotations, NumPy/list compatibility, and the exact source patterns that caused the Windows Pyright failure.
+- Rebuilt the source archive without the accidentally bundled Windows `.venv`, Ruff cache, Python bytecode, or other generated local files.
+
+## 2.1.0 — 2026-08-26
+
+Exact compact and process-parallel Market Replay performance release.
+
+- Added compact read-only NumPy replay arrays that precompute strategy price, valid quote state, genuine Last/bid/ask event flags, and millisecond-exact receipt timestamps once per retained row.
+- Added file-backed read-only ATR arrays shared by spawned worker processes without serializing or duplicating the full Python tick-object graph.
+- Parallelized independent Stage 3 coarse profiles, local refinements, and outward search-boundary probes with one persistent process pool. Candidate generation, ranking, stable-region selection, boundary decisions, bootstrap schedules, and report writing remain serial and deterministic.
+- Added GUI and terminal worker controls: automatic bounded selection, exact single-process execution, or an explicit 2–64 process count. Worker count is excluded from analytical identity and report content.
+- Replaced the retained equity list and second drawdown pass with exact online drawdown accounting in chronological order.
+- Replaced per-component/per-second clamp-observation tuple sets with exact last-second counters.
+- Added an internal normalized-configuration path so compact/profile workers do not repeatedly revalidate immutable settings.
+- Kept broad screening output compact and reruns only selected profiles with full detailed evidence where the existing workflow requires it.
+- Added `multiprocessing.freeze_support()` before application startup and a packaged smoke import of the compact replay module for Windows/PyInstaller spawn compatibility.
+- Added NumPy to runtime and pinned Windows release dependencies.
+- Added exact equivalence tests comparing the original object engine, compact serial engine, and spawned process engine down to candidate and session dictionaries; worker-count and report-determinism tests prove identical analytical output.
+- Added a reproducible benchmark harness and documented measured local speedups without changing the search grid, formulas, robustness gates, or recommendation.
+
+## 2.0.2 — 2026-08-26
+
+Unlimited Market Replay row and recording-count release.
+
+- Removed the 64-recording ceiling from Market Replay configuration, preflight, loading, and terminal options.
+- Removed the 2,000,000 aggregate/per-recording row ceiling from format-v2 and format-v3 import, preflight, and multi-recording combination.
+- Removed the obsolete `--max-ibrec-files` and `--max-ibrec-rows` terminal options.
+- Advanced the Market Replay analysis contract to version 16 and records the row/count limits as absent.
+- Retained byte-size, archive-expansion, ZIP-member, field-size, integrity-chain, duplicate-input, and source-mutation protections.
+- Added regression coverage for more than 64 selected recordings, aggregate row totals above the former ceiling, CLI/help contracts, and source-level absence of hidden row/count checks.
+
 ## 2.0.1 — 2026-08-01
 
 Ruff F841 quality-gate correction release.

@@ -272,7 +272,7 @@ No row is called globally optimal. Every proposed setting requires forward paper
 
 ## 18. Input and integrity
 
-One or more format-2 ZIP and/or format-3 SQLite `.ibrec` recordings are copied independently into a private temporary directory. Every selected recording must describe the same provable instrument identity: symbol, positive conId, currency, security type, exchange time zone, and minimum tick. Duplicate paths and duplicate recording content are rejected. Format 2 validates the manifest, tick schema, checksums when supplied, and bounded archive limits. Format 3 validates schema and SQLite integrity, then verifies every tick/event/RTH record hash, tick and event chain, RTH digest, and latest committed checkpoint. Every original input component is re-hashed after analysis.
+One or more format-2 ZIP and/or format-3 SQLite `.ibrec` recordings are copied independently into a private temporary directory. There is no application-level maximum number of selected recordings and no aggregate/per-recording row-count ceiling. Practical capacity is determined by available memory and runtime. Every selected recording must describe the same provable instrument identity: symbol, positive conId, currency, security type, exchange time zone, and minimum tick. Duplicate paths and duplicate recording content are rejected. Format 2 validates the manifest, tick schema, checksums when supplied, and bounded archive-size/member/field safeguards. Format 3 validates schema and SQLite integrity, then verifies every tick/event/RTH record hash, tick and event chain, RTH digest, and latest committed checkpoint. Every original input component is re-hashed after analysis. Aggregate input-byte and format-v2 expansion limits remain as malformed-input safeguards; they are not row or file-count limits.
 
 The combined dataset contains at most one RTH period per calendar trading date. Verified same-date fragments with matching scheduled boundaries are reduced to a deterministic maximal non-overlapping subset. Selection maximizes observed wall-clock coverage, then live-only coverage, normal-close evidence, retained strategy rows, and fewer fragments, with a content-derived final tie-break. Selected fragments are stitched chronologically; each keeps its own monotonic spacing and later fragments are shifted by their wall-clock offset from the first. The resulting clock is strictly increasing, but the true outage remains visible to ATR freshness, quote age, event-gap, and Last-density gates. Overlapping streams are never interleaved. Conflicting schedules exclude the date. Input order, original filenames, absolute paths, and Python hash seed do not affect the content-derived analysis identity.
 
@@ -466,3 +466,35 @@ event, the additional decline avoided after the exit, recovery regret, and
 whether the exit occurred after an overnight hold. These values explain the
 risk trade-off but do not enter policy selection; the ordinary replay returns,
 costs, drawdown, censoring, and robustness gates remain the ranking evidence.
+
+## 30. Version 2.1 exact compact and parallel execution
+
+The analytical method is unchanged, but broad Stage 3 profile replay uses a
+more efficient execution representation. After Stage 1 and Stage 2 have
+selected ATR windows, each retained session is projected once into a compact
+read-only array. The projection stores only replay-relevant fields and
+precomputes the same strategy-price, valid-quote, and genuine-event semantics
+used by the object engine. Exact receipt epoch milliseconds are retained for
+report timestamps. ATR arrays for selected and outward-probe windows are also
+persisted as read-only file-backed arrays.
+
+One persistent spawned process pool can attach to those arrays. Each task is a
+small deterministic batch of independent profiles. Workers replay every event
+for every assigned profile; they do not downsample rows, reduce the grid,
+perform approximate early stopping, or decide which candidates advance. The
+parent retains exclusive ownership of candidate generation, profile-key order,
+region construction, boundary extension decisions, robustness schedules, and
+recommendation authorization. Worker completion order is discarded by sorting
+returned evidence by canonical profile key.
+
+The hot state machine also updates maximum drawdown online, keeps one exact
+last-sampled second per clamp component, and reuses a pre-normalized immutable
+configuration inside profile workers. These transformations retain the same
+chronological floating-point operation order for strategy and equity
+calculations.
+
+The worker preference is deliberately absent from the analysis/search
+contract. `Automatic`, one process, and explicit multi-process settings must
+produce the same candidate/session evidence, recommendation, analysis ID, and
+report bytes. Any process failure fails the complete run rather than accepting
+a reduced candidate set.

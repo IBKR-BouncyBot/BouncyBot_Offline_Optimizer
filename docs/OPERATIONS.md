@@ -65,6 +65,22 @@ Reports can contain exact timestamps, prices, quantities, order references, P/L,
 
 Open **Market Replay (.ibrec v2/v3)**, add one or more recordings for the same instrument, and select a report output root. **Check recordings** performs bounded structural preflight and aggregate-limit checks. **Analyze recordings** performs the full private-copy and integrity verification, stitches compatible non-overlapping same-date fragments while preserving their outages, compares protective SELL disabled with bounded manual and ATR-adaptive policies, runs the three-stage ATR search separately for the supported policies, applies the complete robustness authorization stack, and writes the deterministic report.
 
+**Profile-evaluation workers** controls the exact Stage 3/outward-probe
+execution engine:
+
+```text
+Automatic  keep inputs below 50,000 retained rows on the reference engine;
+           otherwise leave one logical processor free and use at most eight workers
+1          compact exact single-process execution
+2–64       explicit spawned worker-process count
+```
+
+The worker setting changes runtime only. It is not written into the analytical
+search contract or report identity. Independent profiles are returned to the
+parent and sorted by stable profile key before ranking. A worker error aborts
+the complete analysis; do not lower the worker count to work around a failing
+profile.
+
 The preflight shows lifecycle status for every selected recording and flags synthetic provenance. Full hash-chain/checkpoint verification occurs during analysis. Prefer closed, committed recordings. A format-3 file with an active period is accepted as interrupted recovery evidence, but the affected session remains right-censored. Do not analyze a file while Market Replay Lab is actively writing it; source or rollback-journal mutation causes the run to abort.
 
 The portable build bundles `tzdata` so format-2 liquid-hours reconstruction is available on Windows systems without a separate Python installation. Format 3 uses its explicit UTC RTH periods.
@@ -82,6 +98,7 @@ BouncyBotOfflineOptimizer.exe --no-gui --ibrec `
     "D:\Recordings\AAPL_2026-07-13.ibrec" `
     "D:\Recordings\AAPL_2026-07-14.ibrec" `
     "D:\Recordings\AAPL_2026-07-15.ibrec" `
+    --ibrec-workers 6 `
     --calibration-source-dir "D:\BouncyBot\GUI" `
     --output-dir "D:\Optimizer Reports"
 ```
@@ -110,3 +127,31 @@ Development commands may use `requirements.txt`; a tagged binary release must us
 Exact leave-one-day-out reruns the complete staged selector once per primary trading date. With at least 20 primary-quality sessions, the default analysis also performs expanding walk-forward selection and selection-aware out-of-bag bootstrap. These checks are intentionally more expensive than fixed-profile replay. They are required only for authorizing a changed profile; insufficient evidence produces the unchanged control with explicit failed-gate rows.
 
 Do not interrupt an analysis by deleting partial report directories. The report is published atomically only after all validation files and checksums are complete. Review `recommendation_quality_gates.csv` before transferring any setting to paper trading. A control result means no changed profile passed every gate; it is not proof that the control is optimal.
+
+## Large Market Replay input sets
+
+The Market Replay workflow does not impose a maximum recording count or a
+maximum tick-row count. Very large selections are accepted as long as every
+recording passes structural and instrument-identity validation. Runtime and
+memory use increase with retained strategy events, sessions, candidate search,
+and robustness reruns.
+
+The aggregate input-byte and format-v2 uncompressed-archive safeguards remain
+enabled to reject malformed or unexpectedly expansive input. They are
+configurable in terminal mode and are distinct from the removed row/file-count
+ceilings.
+
+For very large retained datasets, start with `Automatic`. If the machine
+becomes memory-bandwidth constrained, compare an explicit value of four or six
+with the automatic result. A higher process count is not always faster. Small
+recordings are normally faster in single-process mode because worker startup
+cost exceeds the replay work. All supported worker settings must produce the
+same analysis ID and report bytes.
+
+The worker pool remains active after Stage 3 for exact leave-one-day-out
+selector reruns, selection-aware bootstrap replicates, chronological
+walk-forward folds, ATR phase variants, and assumption-stress scenarios.
+Progress text identifies the active operation, execution mode, completed
+tasks, and pending tasks. A completed outward-boundary batch at 100% is
+followed by a new named post-search operation rather than remaining displayed
+for the rest of analysis.

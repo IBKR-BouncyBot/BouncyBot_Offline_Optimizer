@@ -7,11 +7,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$version = "2.0.1"
+$version = "2.3.1"
 $appName = "BouncyBotOfflineOptimizer"
 $runtimeDirectory = "BouncyBotOptimizerRuntime"
 $requiredPythonVersion = "3.11.9"
-$sourceDateEpoch = "1785024000"
+$sourceDateEpoch = "1787788800"
 $releaseName = "BouncyBot_Offline_Optimizer_${version}_Windows_x64"
 $releaseDirectory = Join-Path $root "release"
 $releaseRoot = Join-Path $releaseDirectory $releaseName
@@ -164,6 +164,17 @@ if (!$smokeProcess.WaitForExit(30000)) {
 $smokeProcess.WaitForExit()
 if ($smokeProcess.ExitCode -ne 0) {
     throw "Packaged executable smoke test failed with exit code $($smokeProcess.ExitCode)."
+}
+
+Write-Host "==> Smoke-test packaged spawned worker and NumPy runtime"
+$spawnSmokeProcess = Start-Process -FilePath $exe -ArgumentList "--packaged-multiprocessing-smoke-test" -PassThru
+if (!$spawnSmokeProcess.WaitForExit(60000)) {
+    try { $spawnSmokeProcess.Kill() } catch { }
+    throw "Packaged multiprocessing smoke test timed out after 60 seconds."
+}
+$spawnSmokeProcess.WaitForExit()
+if ($spawnSmokeProcess.ExitCode -ne 0) {
+    throw "Packaged multiprocessing smoke test failed with exit code $($spawnSmokeProcess.ExitCode)."
 }
 
 if (!$SkipReproducibilityCheck) {

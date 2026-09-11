@@ -760,7 +760,7 @@ def test_market_replay_contract_documents_protective_policy_search(
     contract = market_replay_search_contract(
         MarketReplayConfig(tmp_path / "recording.ibrec", tmp_path / "reports")
     )
-    assert contract["contract_version"] == 15
+    assert contract["contract_version"] == 16
     policy = contract["protective_sell_policy_search"]
     assert policy["enabled"] is True
     assert policy["manual_trailing_percentages"] == [1.0, 2.0, 3.0, 4.0, 5.0]

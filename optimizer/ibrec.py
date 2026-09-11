@@ -679,10 +679,6 @@ def _load_v2(
             symbol = str(contract["symbol"])
             con_id = int(contract["con_id"])
             row_count = int(manifest["row_count"])
-            if row_count > config.max_rows:
-                raise IbrecError(
-                    f"Recording contains {row_count:,} rows; configured limit is {config.max_rows:,}."
-                )
             previous_field_limit = csv.field_size_limit()
             csv.field_size_limit(_MAX_CSV_FIELD_BYTES)
             ticks: list[IbrecTick] = []
@@ -718,10 +714,6 @@ def _load_v2(
                                 expected_con_id=con_id,
                             )
                         )
-                        if len(ticks) > config.max_rows:
-                            raise IbrecError(
-                                f"Recording exceeds the configured limit of {config.max_rows:,} rows."
-                            )
                         if row_number % 25_000 == 0:
                             _emit(progress, "Reading Market Replay v2 rows", row_number, row_count)
             finally:
@@ -1044,10 +1036,6 @@ def _load_v3(
             if version != 3:
                 raise IbrecError("Only Market Replay SQLite format version 3 is supported.")
             row_count = int(manifest["row_count"])
-            if row_count > config.max_rows:
-                raise IbrecError(
-                    f"Recording contains {row_count:,} rows; configured limit is {config.max_rows:,}."
-                )
             periods, raw_periods = _v3_periods(
                 connection,
                 int(manifest.get("rth_period_count", 0)),
@@ -2339,17 +2327,14 @@ def load_ibrec_set(
             f"{normalized.max_input_bytes:,}."
         )
     recordings: list[IbrecRecording] = []
-    cumulative_rows = 0
     cumulative_component_bytes = 0
     for index, path in enumerate(paths, start=1):
         _emit(progress, f"Loading Market Replay recording {index} of {len(paths)}", index - 1, len(paths))
         single = MarketReplayConfig(
             recording_path=path,
             output_root=normalized.output_root,
-            max_rows=normalized.max_rows,
             max_input_bytes=normalized.max_input_bytes,
             max_zip_uncompressed_bytes=normalized.max_zip_uncompressed_bytes,
-            max_recordings=1,
             min_atr_pct=normalized.min_atr_pct,
             max_atr_pct=normalized.max_atr_pct,
             assumed_trade_notional=normalized.assumed_trade_notional,
@@ -2391,7 +2376,6 @@ def load_ibrec_set(
             # Ten selected files and one bare message are undiagnosable; every
             # per-recording failure names its source file exactly once.
             raise _recording_set_error(path, exc) from exc
-        cumulative_rows += recording.raw_row_count
         cumulative_component_bytes += sum(
             int(component.get("size") or 0)
             for component in recording.input_components
@@ -2400,11 +2384,6 @@ def load_ibrec_set(
             raise IbrecError(
                 f"Selected recording components total {cumulative_component_bytes:,} bytes after file {index}; "
                 f"configured aggregate limit is {normalized.max_input_bytes:,}."
-            )
-        if cumulative_rows > normalized.max_rows:
-            raise IbrecError(
-                f"Selected recordings contain {cumulative_rows:,} rows after file {index}; configured aggregate "
-                f"limit is {normalized.max_rows:,}."
             )
         recordings.append(recording)
     _emit(progress, "Combining verified Market Replay recordings", len(paths), len(paths))
@@ -2422,10 +2401,8 @@ def inspect_ibrec_set(config: MarketReplayConfig) -> dict[str, Any]:
                 MarketReplayConfig(
                     recording_path=path,
                     output_root=normalized.output_root,
-                    max_rows=normalized.max_rows,
                     max_input_bytes=normalized.max_input_bytes,
                     max_zip_uncompressed_bytes=normalized.max_zip_uncompressed_bytes,
-                    max_recordings=1,
                     min_atr_pct=normalized.min_atr_pct,
                     max_atr_pct=normalized.max_atr_pct,
                 )
@@ -2506,10 +2483,6 @@ def inspect_ibrec_set(config: MarketReplayConfig) -> dict[str, Any]:
         int(item.get("component_size_bytes") or item["size_bytes"])
         for item in details
     )
-    if total_rows > normalized.max_rows:
-        raise IbrecError(
-            f"Selected recordings declare {total_rows:,} rows; configured aggregate limit is {normalized.max_rows:,}."
-        )
     if total_component_bytes > normalized.max_input_bytes:
         raise IbrecError(
             f"Selected recording components total {total_component_bytes:,} bytes; configured aggregate limit is "

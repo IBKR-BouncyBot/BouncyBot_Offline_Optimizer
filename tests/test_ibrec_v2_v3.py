@@ -405,22 +405,14 @@ def test_v2_rejects_duplicate_csv_column(tmp_path: Path) -> None:
         load_ibrec(config(path, tmp_path))
 
 
-def test_input_and_row_limits_are_enforced(tmp_path: Path) -> None:
-    path = write_v3(tmp_path / "limits.ibrec")
-    with pytest.raises(ValueError, match="at least 100"):
-        config(path, tmp_path, max_rows=99).normalized()
-    with pytest.raises(IbrecError, match="configured limit"):
-        load_ibrec(config(path, tmp_path, max_rows=100))
-
-
-@pytest.mark.parametrize("value", [100.5, True, float("inf"), "100.5"])
-def test_integer_limits_reject_fractional_boolean_or_nonfinite_values(
+def test_market_replay_config_has_no_row_or_recording_count_limit(
     tmp_path: Path,
-    value: object,
 ) -> None:
-    path = write_v3(tmp_path / "strict-limits.ibrec")
-    with pytest.raises(ValueError, match="max_rows must be an integer"):
-        config(path, tmp_path, max_rows=value).normalized()
+    path = write_v3(tmp_path / "unlimited.ibrec")
+    fields = MarketReplayConfig.__dataclass_fields__
+    assert "max_rows" not in fields
+    assert "max_recordings" not in fields
+    assert load_ibrec(config(path, tmp_path)).raw_row_count > 0
 
 
 def test_empty_v3_is_valid_for_preflight_but_not_analysis(tmp_path: Path) -> None:
